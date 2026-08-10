@@ -657,7 +657,7 @@ function classifyLines_(item) {
   const allLines = roleLines.concat(cameraLines);
   const executors = allLines.map(executorName_).filter(Boolean);
   const uniqueExecutors = [...new Set(executors)];
-  const isContractorPackage = uniqueExecutors.length === 1 && /^(ИП|СЗ|АНО)(\s|$)/i.test(uniqueExecutors[0]);
+  const isContractorPackage = uniqueExecutors.length === 1 && /^(ИП|СЗ|АНО|ОГАУ|ООО)(\s|$)/i.test(uniqueExecutors[0]);
 
   return { roleLines, cameraLines, uniqueExecutors, kind: isContractorPackage ? 'contractor' : 'full' };
 }
