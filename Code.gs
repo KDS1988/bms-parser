@@ -697,16 +697,25 @@ function classifyLines_(item) {
  * kind='full' — Лига | Команда | N кам, затем амплуа (кроме Выпускающего режиссера):
  * сначала роли аппаратной (розовые), потом видеооператоры (голубые, по числу камер);
  * сама досоздаёт строки через ensureRoomForBlock_, если не хватает места.
- * kind='contractor' — вся техническая часть отдана одному подрядчику (ИП/СЗ/АНО):
+ * kind='contractor' — вся техническая часть отдана одному подрядчику (ИП/СЗ/АНО/ООО/ОГАУ):
  * ровно 2 строки, заголовок + имя подрядчика, без досоздания места (столбик
  * подрядчиков резервируется заранее через reserveContractorSlot_).
+ *
+ * oldExecutorById — исполнители по line.id с прошлого обновления (из слепка в
+ * реестре доски). Нужно, чтобы не затирать вручную вписанные черновые фамилии:
+ * если роль как была, так и осталась не назначена в BMS — колонку исполнителя
+ * для этой строки НЕ трогаем вообще (вдруг там черновик). Если раньше человек
+ * был назначен, а теперь снят — это не черновик, а реальное снятие, тогда чистим.
  */
-function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, item, boardStateMap) {
+function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, item, boardStateMap, oldExecutorById) {
   const league = event.league ? event.league.short_name : '';
   const homeTeam = event.home_team ? event.home_team.name : (event.event_description || '');
   const { roleLines, cameraLines, uniqueExecutors } = classifyLines_(item);
 
   if (kind === 'contractor') {
+    // Блок подрядчика формируется только когда исполнитель у ВСЕХ строк один и
+    // тот же реальный (не пустой) — черновиков тут по определению не бывает,
+    // можно чистить и писать смело.
     sheet.getRange(startRow, col, 2, BOARD_GROUP_WIDTH).clearContent().clearFormat();
     sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
     sheet.getRange(startRow, col + 1).setValue(`${homeTeam} (ID ${item.id})`).setFontWeight('bold');
@@ -724,10 +733,16 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
   const map = loadDayRowMap_(sheet.getName()) || {};
   const nextHeaderRow = map[day + 1];
   const clearRows = nextHeaderRow ? (nextHeaderRow - startRow) : Math.max(neededRows, DEFAULT_DAY_ROWS - 1);
-  sheet.getRange(startRow, col, clearRows, BOARD_GROUP_WIDTH).clearContent().clearFormat();
+
+  // Колонки "роль" (label) и "N кам" — целиком выводятся из BMS, чистим смело.
+  sheet.getRange(startRow, col, clearRows, 1).clearContent().clearFormat();
+  sheet.getRange(startRow, col + 2, clearRows, 1).clearContent().clearFormat();
+  // Колонка исполнителя — только формат (цвет/жирность сбрасываем), СОДЕРЖИМОЕ
+  // не трогаем оптом: в пустых на сегодня строках может лежать черновая фамилия.
+  sheet.getRange(startRow, col + 1, clearRows, 1).clearFormat();
 
   sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
-  sheet.getRange(startRow, col + 1).setValue(`${homeTeam} (ID ${item.id})`).setFontWeight('bold');
+  sheet.getRange(startRow, col + 1).setValue(`${homeTeam} (ID ${item.id})`).setFontWeight('bold'); // шапка — не черновая зона, пишем всегда
   sheet.getRange(startRow, col + 2).setValue(`${cameraLines.length} кам`);
 
   let row = startRow + 1;
@@ -738,7 +753,13 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
     if (executor) {
       cell.setValue(executor);
       applyStatusStyle_(cell, executorStatus_(line));
+    } else if (oldExecutorById && oldExecutorById[line.id]) {
+      // раньше тут реально кто-то был назначен в BMS, теперь снят — это не
+      // черновик, а настоящее снятие с назначения, чистим
+      cell.setValue('');
     }
+    // иначе — роль как была не назначена, так и осталась: не трогаем ячейку,
+    // вдруг там вписанная вручную черновая фамилия
     row++;
   }
   for (const line of cameraLines) {
@@ -747,6 +768,8 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
     if (executor) {
       cell.setValue(executor);
       applyStatusStyle_(cell, executorStatus_(line));
+    } else if (oldExecutorById && oldExecutorById[line.id]) {
+      cell.setValue('');
     }
     row++;
   }
@@ -986,10 +1009,13 @@ function upsertMatchBlock_(event, item, boardStateMap) {
     }
   }
 
-  renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, item, boardStateMap);
+  const oldSig = existing ? JSON.parse(existing.signature || '[]') : [];
+  const oldExecutorById = {};
+  oldSig.forEach(l => { oldExecutorById[l.id] = l.executor; });
+
+  renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, item, boardStateMap, oldExecutorById);
 
   const newSig = lineSignature_(item);
-  const oldSig = existing ? JSON.parse(existing.signature || '[]') : [];
   upsertBoardState_(boardStateMap, item.id, event.id, sheet.getName(), headerRow, col, startRow, kind, JSON.stringify(newSig));
 
   return { isNew: !existing, changes: diffSignatures_(oldSig, newSig) };
