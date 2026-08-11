@@ -138,47 +138,60 @@ def main() -> None:
         print("Нет мероприятий с нужными услугами в горизонте.")
         return
 
-    resp = requests.post(
-        webhook_url,
-        json={"secret": webhook_secret, "events": payload_events},
-        timeout=180,
-    )
-    resp.raise_for_status()
-    result = resp.json()
-    if not result.get("ok"):
-        print("Webhook error:", result.get("error"), file=sys.stderr)
-        sys.exit(1)
-
+    # Отправляем не всё разом, а пачками — запись в Sheets поячеечно небыстрая,
+    # и у веб-приложений Apps Script жёсткий лимит выполнения (6 минут). Один
+    # большой запрос на сотни мероприятий рискует упереться в оба лимита разом
+    # (клиентский таймаут requests и лимит выполнения самого Apps Script).
+    BATCH_SIZE = 15
     events_by_id = {e["event"]["id"]: e["event"] for e in payload_events}
-    for r in result.get("results", []):
-        event = events_by_id.get(r["eventId"])
-        if event is None:
+
+    for i in range(0, len(payload_events), BATCH_SIZE):
+        batch = payload_events[i:i + BATCH_SIZE]
+        try:
+            resp = requests.post(
+                webhook_url,
+                json={"secret": webhook_secret, "events": batch},
+                timeout=300,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+        except requests.exceptions.RequestException as exc:
+            print(f"Пачка {i // BATCH_SIZE + 1}: webhook не ответил вовремя ({exc}), пропускаем — подхватится на следующем запуске.", file=sys.stderr)
             continue
 
-        if r["isNewEvent"]:
-            send_telegram(telegram_token, telegram_chat_id, format_event_message(event))
+        if not result.get("ok"):
+            print(f"Пачка {i // BATCH_SIZE + 1}: webhook error: {result.get('error')}", file=sys.stderr)
+            continue
 
-        for svc in r.get("services", []):
-            if svc.get("error"):
-                print(f"Ошибка записи на доску event_id={r['eventId']}: {svc['error']}", file=sys.stderr)
+        for r in result.get("results", []):
+            event = events_by_id.get(r["eventId"])
+            if event is None:
                 continue
+
             if r["isNewEvent"]:
-                continue  # уже уведомили про мероприятие целиком выше
+                send_telegram(telegram_token, telegram_chat_id, format_event_message(event))
 
-            if svc.get("isNew"):
-                home = event.get("home_team")
-                teams = home["name"] if home else event.get("event_description", "")
-                send_telegram(
-                    telegram_token, telegram_chat_id,
-                    f"➕ В мероприятии {event.get('date', '')} {teams} добавлена услуга \"{svc.get('serviceName', '')}\"",
-                )
-            elif svc.get("changes"):
-                send_telegram(
-                    telegram_token, telegram_chat_id,
-                    format_change_message(event, svc.get("serviceName", ""), svc["changes"]),
-                )
+            for svc in r.get("services", []):
+                if svc.get("error"):
+                    print(f"Ошибка записи на доску event_id={r['eventId']}: {svc['error']}", file=sys.stderr)
+                    continue
+                if r["isNewEvent"]:
+                    continue  # уже уведомили про мероприятие целиком выше
 
-    print(f"Готово. Обработано мероприятий: {len(payload_events)}.")
+                if svc.get("isNew"):
+                    home = event.get("home_team")
+                    teams = home["name"] if home else event.get("event_description", "")
+                    send_telegram(
+                        telegram_token, telegram_chat_id,
+                        f"➕ В мероприятии {event.get('date', '')} {teams} добавлена услуга \"{svc.get('serviceName', '')}\"",
+                    )
+                elif svc.get("changes"):
+                    send_telegram(
+                        telegram_token, telegram_chat_id,
+                        format_change_message(event, svc.get("serviceName", ""), svc["changes"]),
+                    )
+
+    print(f"Готово. Обработано мероприятий: {len(payload_events)} (пачками по {BATCH_SIZE}).")
 
 
 if __name__ == "__main__":
