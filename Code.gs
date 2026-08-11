@@ -67,6 +67,7 @@ function onOpen() {
     .addItem('📋 Обновить график персонала сейчас', 'refreshStaffScheduleNow')
     .addItem('🔬 Дамп структуры выделенных ячеек (для отладки доски)', 'debugDumpSelection')
     .addItem('🧹 Сбросить реестр положений на доске', 'resetBoardState')
+    .addItem('✏️ Добавить мероприятие на доску вручную', 'addManualEntry')
     .addToUi();
 }
 
@@ -601,12 +602,14 @@ function findFreeColumnGroup_(sheet, row) {
  * Резервирует место для очередного КОМПАКТНОГО (подрядчик) блока: если в этот
  * день уже есть "столбик" подрядчиков с местом до конца дня — ставим следующим
  * под предыдущим (2 строки на запись). Если места нет или столбика ещё нет —
- * начинаем новую группу колонок. Позиция столбика хранится в Script Properties
- * отдельно на каждый (лист, строка-шапка).
+ * начинаем новую группу колонок. Позиция столбика хранится в Script Properties,
+ * ключ — по номеру ДНЯ (не строки!): строка-шапка дня может сдвинуться вниз,
+ * если раньше в этом же месяце другому мероприятию понадобилось больше места —
+ * а номер дня месяца от этого не меняется.
  */
 function reserveContractorSlot_(sheet, day, headerRow) {
   const sheetName = sheet.getName();
-  const stackKey = `CSTACK::${sheetName}::${headerRow}`;
+  const stackKey = `CSTACK::${sheetName}::day${day}`;
   const props = PropertiesService.getScriptProperties();
   const raw = props.getProperty(stackKey);
   const stack = raw ? JSON.parse(raw) : null;
@@ -636,7 +639,7 @@ function amplua_(lineName) {
 function executorName_(line) {
   const at = line.assignment_technical;
   if (at && at.employee) return `${at.employee.last_name} ${at.employee.first_name}`.trim();
-  // Подрядчики (ИП/СЗ/АНО), похоже, тоже приходят через assignment_technical.employee
+  // Подрядчики (ИП/СЗ/АНО/ООО/ОГАУ), похоже, тоже приходят через assignment_technical.employee
   // (у некоторых last_name пустой, а всё название — в first_name, отсюда случайные
   // ведущие/замыкающие пробелы) — .trim() выше это лечит.
   // Ниже — запасной путь на случай, если для КАКИХ-ТО строк формат окажется другим.
@@ -644,6 +647,33 @@ function executorName_(line) {
     return String(line.assignment_contractor.contractor.name || '').trim();
   }
   return '';
+}
+
+/** Статус принятия конкретного назначения: 'appointed' (зелёный в BMS, принял) /
+ * 'pending' (жёлтый, отправлено — ждём подтверждения) / 'declined' (красный, отказался) / ''. */
+function executorStatus_(line) {
+  const at = line.assignment_technical;
+  return at ? (at.status || '') : '';
+}
+
+/** Сводный статус по нескольким строкам сразу (для сокращённого блока подрядчика,
+ * где на доске одна строка представляет сразу несколько исходных назначений):
+ * если хоть один отказался — red; если все приняли — appointed; иначе pending. */
+function aggregateStatus_(lines) {
+  const statuses = lines.map(executorStatus_).filter(Boolean);
+  if (statuses.includes('declined')) return 'declined';
+  if (statuses.length > 0 && statuses.every(s => s === 'appointed')) return 'appointed';
+  if (statuses.includes('pending')) return 'pending';
+  return '';
+}
+
+/** Жирный шрифт для принятых, красный текст для отказавшихся, обычный — для ожидающих/пустых. */
+function applyStatusStyle_(cell, status) {
+  if (status === 'declined') {
+    cell.setFontColor('#cc0000');
+  } else if (status === 'appointed') {
+    cell.setFontWeight('bold');
+  }
 }
 
 /** Раскладывает строки услуги на роли аппаратной и видеооператоров, определяет "форму" блока. */
@@ -657,7 +687,7 @@ function classifyLines_(item) {
   const allLines = roleLines.concat(cameraLines);
   const executors = allLines.map(executorName_).filter(Boolean);
   const uniqueExecutors = [...new Set(executors)];
-  const isContractorPackage = uniqueExecutors.length === 1 && /^(ИП|СЗ|АНО|ОГАУ|ООО)(\s|$)/i.test(uniqueExecutors[0]);
+  const isContractorPackage = uniqueExecutors.length === 1 && /^(ИП|СЗ|АНО|ООО|ОГАУ)(\s|$)/i.test(uniqueExecutors[0]);
 
   return { roleLines, cameraLines, uniqueExecutors, kind: isContractorPackage ? 'contractor' : 'full' };
 }
@@ -681,7 +711,8 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
     sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
     sheet.getRange(startRow, col + 1).setValue(`${homeTeam} (ID ${item.id})`).setFontWeight('bold');
     sheet.getRange(startRow, col + 2).setValue(`${cameraLines.length} кам`);
-    sheet.getRange(startRow + 1, col + 1).setValue(uniqueExecutors[0]).setBackground(BOARD_PINK);
+    const contractorCell = sheet.getRange(startRow + 1, col + 1).setValue(uniqueExecutors[0]).setBackground(BOARD_PINK);
+    applyStatusStyle_(contractorCell, aggregateStatus_(roleLines.concat(cameraLines)));
     styleMatchBlock_(sheet, startRow, startRow + 1, col);
     return;
   }
@@ -704,13 +735,19 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
     sheet.getRange(row, col).setValue(amplua_(line.line ? line.line.name : ''));
     const cell = sheet.getRange(row, col + 1).setBackground(BOARD_PINK);
     const executor = executorName_(line);
-    if (executor) cell.setValue(executor);
+    if (executor) {
+      cell.setValue(executor);
+      applyStatusStyle_(cell, executorStatus_(line));
+    }
     row++;
   }
   for (const line of cameraLines) {
     const cell = sheet.getRange(row, col + 1).setBackground(BOARD_BLUE);
     const executor = executorName_(line);
-    if (executor) cell.setValue(executor);
+    if (executor) {
+      cell.setValue(executor);
+      applyStatusStyle_(cell, executorStatus_(line));
+    }
     row++;
   }
   styleMatchBlock_(sheet, startRow, row - 1, col);
@@ -793,8 +830,9 @@ function resetBoardState() {
   const ui = SpreadsheetApp.getUi();
   const confirm = ui.alert(
     'Сбросить реестр доски?',
-    'Это удалит служебный лист _bms_board_state (положения уже отрисованных блоков). ' +
-    'Сами листы месяцев не изменятся, но при следующей перерисовке блоки могут переместиться на новые места. Продолжить?',
+    'Это удалит служебный лист _bms_board_state (положения уже отрисованных блоков) ' +
+    'и все сохранённые "столбики" подрядчиков. Сами листы месяцев не изменятся, но при ' +
+    'следующей перерисовке блоки могут переместиться на новые места. Продолжить?',
     ui.ButtonSet.YES_NO
   );
   if (confirm !== ui.Button.YES) return;
@@ -802,7 +840,66 @@ function resetBoardState() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(CONFIG.BOARD_STATE_SHEET_NAME);
   if (sheet) ss.deleteSheet(sheet);
-  ui.alert('Готово, реестр сброшен.');
+
+  const props = PropertiesService.getScriptProperties();
+  const all = props.getProperties();
+  Object.keys(all).forEach(key => {
+    if (key.startsWith('CSTACK::')) props.deleteProperty(key);
+  });
+
+  ui.alert('Готово, реестр и столбики подрядчиков сброшены.');
+}
+
+const BOARD_MANUAL_BORDER = '#34a853'; // зелёный — ручная запись, ещё не подтверждена в BMS
+
+/**
+ * Вариант A для мероприятий, о которых известно заранее, но менеджер ещё не
+ * внёс их в BMS: добавляет на доску простой блок (только заголовок — лига/
+ * команда/камеры, без разбивки по ролям, т.к. это ещё не BMS-данные) с зелёной
+ * рамкой — чтобы визуально отличать от автоматических записей. У блока нет
+ * event_service_id, поэтому автоматика никогда не сможет сама его найти и
+ * обновить/удалить — когда менеджер реально внесёт это мероприятие в BMS,
+ * появится ОТДЕЛЬНЫЙ автоматический блок рядом, и эту ручную запись нужно
+ * будет удалить самому.
+ */
+function addManualEntry() {
+  const ui = SpreadsheetApp.getUi();
+
+  const dateResp = ui.prompt('Ручная запись на доску', 'Дата (дд.мм.гггг)?', ui.ButtonSet.OK_CANCEL);
+  if (dateResp.getSelectedButton() !== ui.Button.OK) return;
+  const dateIso = parseDateInput_(dateResp.getResponseText().trim());
+  if (!dateIso) { ui.alert('Не понял дату: ' + dateResp.getResponseText()); return; }
+
+  const leagueResp = ui.prompt('Ручная запись на доску', 'Лига (можно оставить пустым)?', ui.ButtonSet.OK_CANCEL);
+  if (leagueResp.getSelectedButton() !== ui.Button.OK) return;
+
+  const teamResp = ui.prompt('Ручная запись на доску', 'Команда / название мероприятия?', ui.ButtonSet.OK_CANCEL);
+  if (teamResp.getSelectedButton() !== ui.Button.OK) return;
+  const teamName = teamResp.getResponseText().trim();
+  if (!teamName) { ui.alert('Название не может быть пустым.'); return; }
+
+  const camResp = ui.prompt('Ручная запись на доску', 'Число камер (можно оставить пустым)?', ui.ButtonSet.OK_CANCEL);
+  if (camResp.getSelectedButton() !== ui.Button.OK) return;
+  const cam = camResp.getResponseText().trim();
+
+  const sheet = getOrCreateMonthSheet_(dateIso);
+  const headerRow = findOrCreateDateHeaderRow_(sheet, dateIso);
+  const col = findFreeColumnGroup_(sheet, headerRow + 1);
+  const startRow = headerRow + 1;
+
+  sheet.getRange(startRow, col).setValue(leagueResp.getResponseText().trim()).setFontWeight('bold');
+  sheet.getRange(startRow, col + 1).setValue(`${teamName} (вручную)`).setFontWeight('bold');
+  if (cam) sheet.getRange(startRow, col + 2).setValue(`${cam} кам`);
+
+  const range = sheet.getRange(startRow, col, 1, BOARD_GROUP_WIDTH);
+  range.setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true);
+  range.setBorder(true, true, true, true, false, false, BOARD_MANUAL_BORDER, SpreadsheetApp.BorderStyle.SOLID_THICK);
+
+  ui.alert(
+    'Добавлено с зелёной рамкой. Когда менеджер внесёт то же самое в BMS, ' +
+    'автоматика создаст рядом отдельный блок (связать их напрямую код не умеет) — ' +
+    'не забудь тогда удалить эту ручную запись.'
+  );
 }
 
 function getBoardStateSheet_() {
@@ -1327,6 +1424,18 @@ function doPoll() {
  * GitHub Actions.
  */
 function doPost(e) {
+  // Блокировка: если два запроса (например, ручной запуск GitHub Actions
+  // наложился на плановый по крону) прилетят почти одновременно, второй
+  // дождётся, пока первый допишет данные — без этого оба могли бы одновременно
+  // не увидеть изменений друг друга и задвоить мероприятия на доске.
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (lockErr) {
+    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: 'busy, retry' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
   try {
     const body = JSON.parse(e.postData.contents);
     if (body.secret !== getSecret_('WEBHOOK_SECRET')) {
@@ -1346,6 +1455,8 @@ function doPost(e) {
   } catch (err) {
     return ContentService.createTextOutput(JSON.stringify({ ok: false, error: String(err) }))
       .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
   }
 }
 
