@@ -1,0 +1,46 @@
+name: BMS Poll
+
+on:
+  schedule:
+    # 7:00 МСК = 04:00 UTC (МСК всегда UTC+3, без перехода на летнее время).
+    # GitHub не гарантирует запуск ровно в срок (возможны задержки в пиковые
+    # часы) и отключает scheduled workflows после ~60 дней без активности в
+    # репозитории — если заметишь, что перестало работать само по расписанию,
+    # зайди в Actions и включи workflow заново.
+    - cron: '0 4 * * *'
+  workflow_dispatch: {} # ручной запуск по кнопке "Run workflow" в Actions — точечное обновление когда нужно
+
+# Не даём двум прогонам работать одновременно (например, ручной запуск
+# наложится на плановый по крону) — иначе оба одновременно опрашивают BMS
+# и пишут через webhook, что раньше приводило к задвоенным записям на доске.
+# queued — следующий запуск просто подождёт своей очереди, а не отменится.
+concurrency:
+  group: bms-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install requests
+
+      - name: Опросить BMS и отправить в Apps Script / Telegram
+        env:
+          BMS_REFRESH_TOKEN: ${{ secrets.BMS_REFRESH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          APPS_SCRIPT_WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: python poll_bms.py
+
+      - name: Обновить BMS_REFRESH_TOKEN (он ротируется при каждом refresh)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh secret set BMS_REFRESH_TOKEN --repo "${{ github.repository }}" < state/refresh_token.txt
