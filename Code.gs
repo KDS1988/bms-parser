@@ -660,12 +660,13 @@ function reserveContractorSlot_(sheet, day, headerRow) {
 }
 
 /**
- * Пишет заголовочную ячейку блока (команда + ID услуги). Если мероприятие
- * отменено в BMS (service_status начинается с "Отмен") — добавляет " ОТМЕНА"
- * красным жирным, остальной текст — обычным жирным, как всегда.
+ * Пишет заголовочную ячейку блока (команда + ID мероприятия — по нему ищут
+ * в фильтре BMS, ID услуги для этого не годится). Если мероприятие отменено
+ * в BMS (service_status начинается с "Отмен") — добавляет " ОТМЕНА" красным
+ * жирным, остальной текст — обычным жирным, как всегда.
  */
-function setHeaderTeamCell_(cell, homeTeam, itemId, isCancelled) {
-  const base = `${homeTeam} (ID ${itemId})`;
+function setHeaderTeamCell_(cell, homeTeam, eventId, isCancelled) {
+  const base = `${homeTeam} (ID ${eventId})`;
   if (!isCancelled) {
     cell.setValue(base).setFontWeight('bold').setFontColor(null);
     return;
@@ -768,7 +769,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
     // можно чистить и писать смело.
     sheet.getRange(startRow, col, 2, BOARD_GROUP_WIDTH).clearContent().clearFormat();
     sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
-    setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, item.id, isCancelled);
+    setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, isCancelled);
     sheet.getRange(startRow, col + 2).setValue(`${cameraLines.length} кам`);
     const contractorCell = sheet.getRange(startRow + 1, col + 1).setValue(uniqueExecutors[0]).setBackground(BOARD_PINK);
     applyStatusStyle_(contractorCell, aggregateStatus_(roleLines.concat(cameraLines)));
@@ -792,7 +793,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
   sheet.getRange(startRow, col + 1, clearRows, 1).clearFormat();
 
   sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
-  setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, item.id, isCancelled); // шапка — не черновая зона, пишем всегда
+  setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, isCancelled); // шапка — не черновая зона, пишем всегда
   sheet.getRange(startRow, col + 2).setValue(`${cameraLines.length} кам`);
 
   let row = startRow + 1;
