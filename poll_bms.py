@@ -74,12 +74,24 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
         print(f"Telegram error: {resp.status_code} {resp.text}", file=sys.stderr)
 
 
+def event_display_name(event: dict) -> str:
+    """Короткое отображаемое название: сингл — команда хозяев (или обе через тире),
+    гибрид — короткое additional_info ("Информация -> Название" в BMS), у гибридных
+    нет команд, а event_description обычно длинный/многословный. Фолбэк на
+    event_description, если additional_info пуст."""
+    home = event.get("home_team")
+    away = event.get("away_team")
+    if home and away:
+        return f"{home['name']} — {away['name']}"
+    if home:
+        return home["name"]
+    return event.get("additional_info") or event.get("event_description") or ""
+
+
 def format_event_message(event: dict) -> str:
     sport = (event.get("sport_type") or {}).get("name", "")
     league = (event.get("league") or {}).get("short_name", "")
-    home = event.get("home_team")
-    away = event.get("away_team")
-    teams = f"{home['name']} — {away['name']}" if home and away else event.get("event_description", "")
+    teams = event_display_name(event)
     location = (event.get("location") or {}).get("name") or event.get("venue", "")
 
     lines = [
@@ -94,9 +106,7 @@ def format_event_message(event: dict) -> str:
 
 
 def format_change_message(event: dict, service_name: str, changes: list[str]) -> str:
-    home = event.get("home_team")
-    away = event.get("away_team")
-    teams = f"{home['name']} — {away['name']}" if home and away else event.get("event_description", "")
+    teams = event_display_name(event)
     lines = [
         "🔄 <b>Изменение в мероприятии</b>",
         f"{event.get('date', '')} {event.get('start_time', '')} {teams}".strip(),
@@ -179,8 +189,7 @@ def main() -> None:
                     continue  # уже уведомили про мероприятие целиком выше
 
                 if svc.get("isNew"):
-                    home = event.get("home_team")
-                    teams = home["name"] if home else event.get("event_description", "")
+                    teams = event_display_name(event)
                     send_telegram(
                         telegram_token, telegram_chat_id,
                         f"➕ В мероприятии {event.get('date', '')} {teams} добавлена услуга \"{svc.get('serviceName', '')}\"",
