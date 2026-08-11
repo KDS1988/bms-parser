@@ -589,13 +589,30 @@ function bumpBoardStateHeaderRows_(sheetName, afterHeaderRow, delta, boardStateM
   });
 }
 
-/** Ищет первую свободную группу колонок (ширина BOARD_GROUP_WIDTH) в строке, начиная с B. */
-function findFreeColumnGroup_(sheet, row) {
+/**
+ * Ищет первую свободную группу колонок (ширина BOARD_GROUP_WIDTH) в строке,
+ * начиная с B. Колонка считается занятой, если там непусто ИЛИ если её для
+ * этого дня уже застолбил столбик подрядчиков (CSTACK) — даже если конкретная
+ * верхняя ячейка сейчас выглядит пустой (например, столбик переехал оттуда,
+ * а Script Properties по-прежнему её "помнит" — раньше это приводило к
+ * наложению обычного блока поверх столбика подрядчиков).
+ */
+function findFreeColumnGroup_(sheet, row, day) {
+  const reservedByStack = day != null
+    ? getStackReservedCol_(sheet.getName(), day)
+    : null;
+
   let col = 2; // B
-  while (sheet.getRange(row, col).getValue() !== '') {
+  while (sheet.getRange(row, col).getValue() !== '' || col === reservedByStack) {
     col += BOARD_GROUP_WIDTH;
   }
   return col;
+}
+
+/** Колонка, которую для этого дня держит столбик подрядчиков (если есть). */
+function getStackReservedCol_(sheetName, day) {
+  const raw = PropertiesService.getScriptProperties().getProperty(`CSTACK::${sheetName}::day${day}`);
+  return raw ? JSON.parse(raw).col : null;
 }
 
 /**
@@ -623,12 +640,33 @@ function reserveContractorSlot_(sheet, day, headerRow) {
     col = stack.col;
     startRow = stack.nextRow;
   } else {
-    col = findFreeColumnGroup_(sheet, headerRow + 1);
+    col = findFreeColumnGroup_(sheet, headerRow + 1, day);
     startRow = headerRow + 1;
   }
 
   props.setProperty(stackKey, JSON.stringify({ col, nextRow: startRow + 2 }));
   return { col, startRow };
+}
+
+/**
+ * Пишет заголовочную ячейку блока (команда + ID услуги). Если мероприятие
+ * отменено в BMS (service_status начинается с "Отмен") — добавляет " ОТМЕНА"
+ * красным жирным, остальной текст — обычным жирным, как всегда.
+ */
+function setHeaderTeamCell_(cell, homeTeam, itemId, isCancelled) {
+  const base = `${homeTeam} (ID ${itemId})`;
+  if (!isCancelled) {
+    cell.setValue(base).setFontWeight('bold').setFontColor(null);
+    return;
+  }
+  const suffix = ' ОТМЕНА';
+  const full = base + suffix;
+  const rich = SpreadsheetApp.newRichTextValue()
+    .setText(full)
+    .setTextStyle(0, base.length, SpreadsheetApp.newTextStyle().setBold(true).setForegroundColor('#000000').build())
+    .setTextStyle(base.length, full.length, SpreadsheetApp.newTextStyle().setBold(true).setForegroundColor('#cc0000').build())
+    .build();
+  cell.setRichTextValue(rich);
 }
 
 function amplua_(lineName) {
@@ -711,6 +749,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
   const league = event.league ? event.league.short_name : '';
   const homeTeam = event.home_team ? event.home_team.name : (event.event_description || '');
   const { roleLines, cameraLines, uniqueExecutors } = classifyLines_(item);
+  const isCancelled = !!(item.service_status && item.service_status.indexOf('Отмен') === 0);
 
   if (kind === 'contractor') {
     // Блок подрядчика формируется только когда исполнитель у ВСЕХ строк один и
@@ -718,7 +757,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
     // можно чистить и писать смело.
     sheet.getRange(startRow, col, 2, BOARD_GROUP_WIDTH).clearContent().clearFormat();
     sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
-    sheet.getRange(startRow, col + 1).setValue(`${homeTeam} (ID ${item.id})`).setFontWeight('bold');
+    setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, item.id, isCancelled);
     sheet.getRange(startRow, col + 2).setValue(`${cameraLines.length} кам`);
     const contractorCell = sheet.getRange(startRow + 1, col + 1).setValue(uniqueExecutors[0]).setBackground(BOARD_PINK);
     applyStatusStyle_(contractorCell, aggregateStatus_(roleLines.concat(cameraLines)));
@@ -742,7 +781,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
   sheet.getRange(startRow, col + 1, clearRows, 1).clearFormat();
 
   sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
-  sheet.getRange(startRow, col + 1).setValue(`${homeTeam} (ID ${item.id})`).setFontWeight('bold'); // шапка — не черновая зона, пишем всегда
+  setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, item.id, isCancelled); // шапка — не черновая зона, пишем всегда
   sheet.getRange(startRow, col + 2).setValue(`${cameraLines.length} кам`);
 
   let row = startRow + 1;
@@ -907,7 +946,8 @@ function addManualEntry() {
 
   const sheet = getOrCreateMonthSheet_(dateIso);
   const headerRow = findOrCreateDateHeaderRow_(sheet, dateIso);
-  const col = findFreeColumnGroup_(sheet, headerRow + 1);
+  const day = new Date(dateIso).getDate();
+  const col = findFreeColumnGroup_(sheet, headerRow + 1, day);
   const startRow = headerRow + 1;
 
   sheet.getRange(startRow, col).setValue(leagueResp.getResponseText().trim()).setFontWeight('bold');
@@ -1004,7 +1044,7 @@ function upsertMatchBlock_(event, item, boardStateMap) {
     if (kind === 'contractor') {
       ({ col, startRow } = reserveContractorSlot_(sheet, day, headerRow));
     } else {
-      col = findFreeColumnGroup_(sheet, headerRow + 1);
+      col = findFreeColumnGroup_(sheet, headerRow + 1, day);
       startRow = headerRow + 1;
     }
   }
