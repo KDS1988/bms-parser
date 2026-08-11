@@ -1070,7 +1070,71 @@ function upsertMatchBlock_(event, item, boardStateMap) {
   const newSig = lineSignature_(item);
   upsertBoardState_(boardStateMap, item.id, event.id, sheet.getName(), headerRow, col, startRow, kind, JSON.stringify(newSig));
 
-  return { isNew: !existing, changes: diffSignatures_(oldSig, newSig) };
+  return {
+    isNew: !existing,
+    changes: diffSignatures_(oldSig, newSig),
+    newlyDeclined: detectNewlyDeclined_(oldSig, newSig),
+  };
+}
+
+/** Строки, которые ИМЕННО СЕЙЧАС стали "declined" (раньше были другим статусом). */
+function detectNewlyDeclined_(oldSig, newSig) {
+  const oldMap = {};
+  (oldSig || []).forEach(l => { oldMap[l.id] = l; });
+  return newSig.filter(l => l.status === 'declined' && (!oldMap[l.id] || oldMap[l.id].status !== 'declined'));
+}
+
+/**
+ * Отказ от назначения: смотрит "График персонала" (кэш _staff_schedule_raw) —
+ * все сотрудники с этим же амплуа, свободные в эту дату — и шлёт в Telegram
+ * список кандидатов на замену, отсортированный по категории (звёздам) по убыванию.
+ */
+function notifyReplacementCandidates_(event, item, declinedLine) {
+  const amplua = declinedLine.name;
+  const ampluaShort = amplua_(amplua);
+  const teams = eventDisplayName_(event);
+  const serviceName = item.service ? item.service.name : '';
+
+  const header = [
+    `⚠️ <b>Отказ от назначения</b>`,
+    `${event.date} ${event.start_time || ''} ${teams}`.trim(),
+    serviceName,
+    `${ampluaShort}: ${declinedLine.executor || '—'} — отказался`,
+    '',
+  ];
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const raw = ss.getSheetByName(STAFF_RAW_SHEET_NAME);
+  if (!raw || raw.getLastRow() < 2) {
+    sendTelegramMessage_(header.concat(
+      '⚠️ График персонала пуст — не могу предложить замену. Меню BMS → "Обновить график персонала сейчас".'
+    ).join('\n'));
+    return;
+  }
+
+  const data = raw.getRange(2, 1, raw.getLastRow() - 1, 8).getValues();
+  const candidates = [];
+  for (const r of data) {
+    const [line, category, fullName, phone, , , date, cellText] = r;
+    if (line !== amplua) continue;
+    const dStr = date instanceof Date ? Utilities.formatDate(date, 'Europe/Moscow', 'yyyy-MM-dd') : String(date);
+    if (dStr !== event.date) continue;
+    if (cellText !== 'свободен') continue;
+    if (fullName === declinedLine.executor) continue; // сам отказавшийся не в списке замен
+    candidates.push({ fullName, category: String(category || ''), phone });
+  }
+
+  // по убыванию числа звёзд в категории ("****" впереди "**")
+  candidates.sort((a, b) => b.category.length - a.category.length);
+
+  const body = candidates.length === 0
+    ? ['Свободных замен на эту дату по графику персонала не найдено.']
+    : ['Возможные замены (по убыванию категории):',
+      ...candidates.slice(0, 10).map(c =>
+        `${c.category || '—'} ${c.fullName}${c.phone ? ' — ' + c.phone : ''}`
+      )];
+
+  sendTelegramMessage_(header.concat(body).join('\n'));
 }
 
 function formatChangeMessage_(event, item, changes) {
@@ -1469,6 +1533,14 @@ function processEventEntry_(event, items, seenEvents, boardStateMap) {
       sendTelegramMessage_(
         `➕ В мероприятии ${event.date} ${eventDisplayName_(event)} добавлена услуга "${item.service.name}"`.trim()
       );
+    }
+
+    for (const declinedLine of (result.isNew ? [] : result.newlyDeclined)) {
+      try {
+        notifyReplacementCandidates_(event, item, declinedLine);
+      } catch (e) {
+        Logger.log(`Не удалось подобрать замену event_id=${event.id}, line=${declinedLine.name}: ${e}`);
+      }
     }
   }
 }
