@@ -591,11 +591,12 @@ function bumpBoardStateHeaderRows_(sheetName, afterHeaderRow, delta, boardStateM
 
 /**
  * Ищет первую свободную группу колонок (ширина BOARD_GROUP_WIDTH) в строке,
- * начиная с B. Колонка считается занятой, если там непусто ИЛИ если её для
- * этого дня уже застолбил столбик подрядчиков (CSTACK) — даже если конкретная
- * верхняя ячейка сейчас выглядит пустой (например, столбик переехал оттуда,
- * а Script Properties по-прежнему её "помнит" — раньше это приводило к
- * наложению обычного блока поверх столбика подрядчиков).
+ * начиная с B. Колонка считается занятой, если непуста ячейка с командой/
+ * описанием (col+1) ИЛИ если её для этого дня уже застолбил столбик
+ * подрядчиков (CSTACK). Проверяем именно col+1, а не col (лига) — у части
+ * мероприятий (например, соревнования без структурированной лиги в BMS)
+ * ячейка с лигой законно пустая, и раньше это заставляло код считать занятую
+ * колонку свободной — из-за чего новые блоки садились поверх старых.
  */
 function findFreeColumnGroup_(sheet, row, day) {
   const reservedByStack = day != null
@@ -603,7 +604,7 @@ function findFreeColumnGroup_(sheet, row, day) {
     : null;
 
   let col = 2; // B
-  while (sheet.getRange(row, col).getValue() !== '' || col === reservedByStack) {
+  while (sheet.getRange(row, col + 1).getValue() !== '' || col === reservedByStack) {
     col += BOARD_GROUP_WIDTH;
   }
   return col;
