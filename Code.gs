@@ -277,12 +277,26 @@ function sendTelegramMessage_(text) {
   });
 }
 
+/**
+ * Короткое отображаемое название мероприятия для доски/уведомлений:
+ * - сингл (event_type: "single") — команда хозяев (или "хозяева — гости", где применимо)
+ * - гибрид (event_type: "hybrid") — короткое additional_info ("Информация -> Название"
+ *   в самой BMS), т.к. у гибридных нет команд, а event_description обычно длинный и
+ *   многословный, для доски не годится
+ * Фолбэк на event_description, если additional_info пуст.
+ */
+function eventDisplayName_(event) {
+  if (event.home_team && event.away_team) {
+    return `${event.home_team.name} — ${event.away_team.name}`;
+  }
+  if (event.home_team) return event.home_team.name;
+  return event.additional_info || event.event_description || '';
+}
+
 function formatEventMessage_(event) {
   const sport = event.sport_type ? event.sport_type.name : '';
   const league = event.league ? event.league.short_name : '';
-  const teams = event.home_team && event.away_team
-    ? `${event.home_team.name} — ${event.away_team.name}`
-    : (event.event_description || '');
+  const teams = eventDisplayName_(event);
   const location = event.location ? event.location.name : (event.venue || '');
 
   return [
@@ -320,9 +334,7 @@ function appendNewEventRow_(event, item) {
   const sheet = getNewEventsSheet_();
   const sport = event.sport_type ? event.sport_type.name : '';
   const league = event.league ? event.league.short_name : '';
-  const teams = event.home_team && event.away_team
-    ? `${event.home_team.name} — ${event.away_team.name}`
-    : (event.event_description || '');
+  const teams = eventDisplayName_(event);
   const location = event.location ? event.location.name : (event.venue || '');
   const city = (event.location && event.location.city)
     || (event.home_team && event.home_team.city)
@@ -369,9 +381,7 @@ function appendTechBlockRows_(event, item) {
   if (!item.event_service_lines || item.event_service_lines.length === 0) return;
 
   const sheet = getTechBlockSheet_();
-  const teams = event.home_team && event.away_team
-    ? `${event.home_team.name} — ${event.away_team.name}`
-    : (event.event_description || '');
+  const teams = eventDisplayName_(event);
   const serviceName = item.service ? item.service.name : '';
   const now = new Date();
 
@@ -748,7 +758,7 @@ function classifyLines_(item) {
  */
 function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, item, boardStateMap, oldExecutorById) {
   const league = event.league ? event.league.short_name : '';
-  const homeTeam = event.home_team ? event.home_team.name : (event.event_description || '');
+  const homeTeam = eventDisplayName_(event);
   const { roleLines, cameraLines, uniqueExecutors } = classifyLines_(item);
   const isCancelled = !!(item.service_status && item.service_status.indexOf('Отмен') === 0);
 
@@ -1063,7 +1073,7 @@ function upsertMatchBlock_(event, item, boardStateMap) {
 }
 
 function formatChangeMessage_(event, item, changes) {
-  const teams = event.home_team ? event.home_team.name : (event.event_description || '');
+  const teams = eventDisplayName_(event);
   return [
     `🔄 <b>Изменение в мероприятии</b>`,
     `${event.date} ${event.start_time || ''} ${teams}`.trim(),
@@ -1456,7 +1466,7 @@ function processEventEntry_(event, items, seenEvents, boardStateMap) {
       sendTelegramMessage_(formatChangeMessage_(event, item, result.changes));
     } else if (!isNewEvent && result.isNew) {
       sendTelegramMessage_(
-        `➕ В мероприятии ${event.date} ${event.home_team ? event.home_team.name : ''} добавлена услуга "${item.service.name}"`.trim()
+        `➕ В мероприятии ${event.date} ${eventDisplayName_(event)} добавлена услуга "${item.service.name}"`.trim()
       );
     }
   }
