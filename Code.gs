@@ -67,6 +67,7 @@ function onOpen() {
     .addItem('📋 Обновить график персонала сейчас', 'refreshStaffScheduleNow')
     .addItem('🔬 Дамп структуры выделенных ячеек (для отладки доски)', 'debugDumpSelection')
     .addItem('🧹 Сбросить реестр положений на доске', 'resetBoardState')
+    .addItem('🔍 Найти замену по ID мероприятия...', 'findReplacementsManually')
     .addItem('✏️ Добавить мероприятие на доску вручную', 'addManualEntry')
     .addToUi();
 }
@@ -922,6 +923,41 @@ function resetBoardState() {
   });
 
   ui.alert('Готово, реестр и столбики подрядчиков сброшены.');
+}
+
+/**
+ * Ручной поиск замены: запрашивает ID мероприятия (event_id, не event_service_id),
+ * находит все услуги этого мероприятия, для КАЖДОЙ строки со статусом "declined"
+ * (независимо от того, впервые это или нет) показывает подбор замен — минуя
+ * логику "уведомляем только на переходе", удобно для проверки/повторного запроса.
+ */
+function findReplacementsManually() {
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.prompt('Найти замену', 'ID мероприятия (event_id из BMS):', ui.ButtonSet.OK_CANCEL);
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+  const eventId = parseInt(resp.getResponseText().trim(), 10);
+  if (!eventId) { ui.alert('Не понял ID: ' + resp.getResponseText()); return; }
+
+  const items = fetchUpcomingAssignments_();
+  const matches = items.filter(it => it.event.id === eventId);
+  if (matches.length === 0) {
+    ui.alert(`event_id=${eventId} не найден в горизонте LOOKAHEAD_DAYS (${CONFIG.LOOKAHEAD_DAYS} дней вперёд).`);
+    return;
+  }
+
+  let sent = 0;
+  for (const item of matches) {
+    if (!item.service || !CONFIG.TARGET_SERVICES.includes(item.service.name)) continue;
+    const declinedLines = lineSignature_(item).filter(l => l.status === 'declined');
+    for (const line of declinedLines) {
+      notifyReplacementCandidates_(matches[0].event, item, line);
+      sent++;
+    }
+  }
+
+  ui.alert(sent > 0
+    ? `Готово, отправлено сообщений: ${sent}.`
+    : 'Отказавшихся строк по нужным услугам не найдено — проверь ID или статус в BMS.');
 }
 
 const BOARD_MANUAL_BORDER = '#34a853'; // зелёный — ручная запись, ещё не подтверждена в BMS
