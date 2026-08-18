@@ -460,12 +460,35 @@ const WEEKDAYS_RU = ['воскресенье', 'понедельник', 'вто
 const AMPLUA_ABBR = {
   'Режиссер многокамерного эфира': 'реж',
   'Режиссер однокамерного эфира': 'реж',
-  'Режиссер повторов': 'повтор',
+  'Режиссер повторов': 'повт',
   'Режиссер графики': 'титры',
   'Выпускающий режиссер': 'ВР',
+  'Звукорежиссер': 'звук',
+  'Инженер': 'инж', // ловит и просто "Инженер", и "Инженер видеоповторов"
   'Видеооператор': 'опер',
   'Продюсер': 'прод',
 };
+
+/**
+ * Порядок вывода ролей на доске — принудительный, не зависит от того, в каком
+ * порядке их вернула BMS (там это просто порядок ввода менеджером, часто
+ * хаотичный). Первое совпадение по подстроке побеждает — специфичные виды
+ * "Режиссера" идут раньше общего "Режиссер", иначе "Режиссер повторов"
+ * ошибочно попал бы в общую категорию.
+ */
+const ROLE_SORT_KEYWORDS = [
+  'Продюсер',
+  'Режиссер повторов',
+  'Режиссер графики',
+  'Звукорежиссер',
+  'Инженер',
+  'Режиссер', // общий (много-/однокамерного эфира) — после специфичных видов
+];
+
+function roleSortRank_(lineName) {
+  const idx = ROLE_SORT_KEYWORDS.findIndex(k => lineName && lineName.includes(k));
+  return idx === -1 ? ROLE_SORT_KEYWORDS.length : idx;
+}
 
 const BOARD_PINK = '#f4cccc';
 const BOARD_BLUE = '#cfe2f3';
@@ -666,8 +689,20 @@ function reserveContractorSlot_(sheet, day, headerRow) {
  * в BMS (service_status начинается с "Отмен") — добавляет " ОТМЕНА" красным
  * жирным, остальной текст — обычным жирным, как всегда.
  */
-function setHeaderTeamCell_(cell, homeTeam, eventId, isCancelled) {
+/**
+ * Пишет заголовочную ячейку блока (команда + ID мероприятия — по нему ищут
+ * в фильтре BMS, ID услуги для этого не годится). Если мероприятие отменено
+ * в BMS (service_status начинается с "Отмен") — добавляет " ОТМЕНА" красным
+ * жирным, остальной текст — обычным жирным, как всегда.
+ *
+ * itemId (event_service_id) пишется в ЗАМЕТКУ ячейки (невидимую, только по
+ * наведению) — по ней код узнаёт блок, даже если его перенесли вручную в
+ * пределах дня (Sheets переносит заметку вместе с содержимым при вырезании/
+ * вставке или перетаскивании диапазона).
+ */
+function setHeaderTeamCell_(cell, homeTeam, eventId, isCancelled, itemId) {
   const base = `${homeTeam} (ID ${eventId})`;
+  cell.setNote(String(itemId));
   if (!isCancelled) {
     cell.setValue(base).setFontWeight('bold').setFontColor(null);
     return;
@@ -733,7 +768,9 @@ function classifyLines_(item) {
     !(l.line && l.line.name && l.line.name.includes('Выпускающий режиссер'))
   );
   const cameraLines = lines.filter(l => l.line && l.line.name && l.line.name.includes('Видеооператор'));
-  const roleLines = lines.filter(l => !cameraLines.includes(l));
+  const roleLines = lines
+    .filter(l => !cameraLines.includes(l))
+    .sort((a, b) => roleSortRank_(a.line ? a.line.name : '') - roleSortRank_(b.line ? b.line.name : ''));
 
   const allLines = roleLines.concat(cameraLines);
   const executors = allLines.map(executorName_).filter(Boolean);
@@ -770,7 +807,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
     // можно чистить и писать смело.
     sheet.getRange(startRow, col, 2, BOARD_GROUP_WIDTH).clearContent().clearFormat();
     sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
-    setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, isCancelled);
+    setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, isCancelled, item.id);
     sheet.getRange(startRow, col + 2).setValue(`${cameraLines.length} кам`);
     const contractorCell = sheet.getRange(startRow + 1, col + 1).setValue(uniqueExecutors[0]).setBackground(BOARD_PINK);
     applyStatusStyle_(contractorCell, aggregateStatus_(roleLines.concat(cameraLines)));
@@ -794,7 +831,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
   sheet.getRange(startRow, col + 1, clearRows, 1).clearFormat();
 
   sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
-  setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, isCancelled); // шапка — не черновая зона, пишем всегда
+  setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, isCancelled, item.id); // шапка — не черновая зона, пишем всегда
   sheet.getRange(startRow, col + 2).setValue(`${cameraLines.length} кам`);
 
   let row = startRow + 1;
@@ -1013,6 +1050,27 @@ function addManualEntry() {
   );
 }
 
+/**
+ * Ищет положение блока по невидимой метке (event_service_id в заметке
+ * заголовочной ячейки) в пределах строк одного дня — на случай, если блок
+ * перенесли вручную и сохранённые координаты устарели. Проверяет только
+ * "заголовочные" позиции колонок (col+1 у каждой группы из BOARD_GROUP_WIDTH).
+ */
+function findBlockPositionByNote_(sheet, headerRow, dayBottom, itemIdStr) {
+  const numRows = dayBottom - headerRow;
+  if (numRows <= 0) return null;
+  const maxCol = 60; // с запасом на реальную ширину доски
+  for (let col = 2; col <= maxCol; col += BOARD_GROUP_WIDTH) {
+    const notes = sheet.getRange(headerRow + 1, col + 1, numRows, 1).getNotes();
+    for (let i = 0; i < notes.length; i++) {
+      if (notes[i][0] === itemIdStr) {
+        return { col, startRow: headerRow + 1 + i };
+      }
+    }
+  }
+  return null;
+}
+
 function getBoardStateSheet_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(CONFIG.BOARD_STATE_SHEET_NAME);
@@ -1070,11 +1128,25 @@ function upsertBoardState_(map, eventServiceId, eventId, sheetName, headerRow, c
  */
 function upsertMatchBlock_(event, item, boardStateMap) {
   const key = String(item.id);
-  const existing = boardStateMap[key];
+  let existing = boardStateMap[key];
 
   const sheet = getOrCreateMonthSheet_(event.date);
   const headerRow = findOrCreateDateHeaderRow_(sheet, event.date);
   const day = new Date(event.date).getDate();
+
+  // Если помним прошлую позицию — проверим, что там всё ещё лежит именно этот
+  // блок (по невидимой метке в заметке ячейки). Если нет — вероятно, блок
+  // перенесли вручную в пределах того же дня; ищем его заново по всему дню и
+  // подхватываем новое место, вместо того чтобы писать поверх старых координат.
+  if (existing && existing.sheetName === sheet.getName()) {
+    const storedNote = sheet.getRange(existing.startRow, existing.col + 1).getNote();
+    if (storedNote !== key) {
+      const dayMap = loadDayRowMap_(sheet.getName()) || {};
+      const dayBottom = (dayMap[day + 1] || (headerRow + DEFAULT_DAY_ROWS)) - 1;
+      const found = findBlockPositionByNote_(sheet, headerRow, dayBottom, key);
+      existing = found ? Object.assign({}, existing, { col: found.col, startRow: found.startRow }) : null;
+    }
+  }
 
   const { kind } = classifyLines_(item);
 
