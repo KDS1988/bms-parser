@@ -476,18 +476,25 @@ const AMPLUA_ABBR = {
  * "Режиссера" идут раньше общего "Режиссер", иначе "Режиссер повторов"
  * ошибочно попал бы в общую категорию.
  */
-const ROLE_SORT_KEYWORDS = [
-  'Продюсер',
-  'Режиссер повторов',
-  'Режиссер графики',
-  'Звукорежиссер',
-  'Инженер',
-  'Режиссер', // общий (много-/однокамерного эфира) — после специфичных видов
+/**
+ * Правила сортировки ролей: проверка совпадения идёт по паттерну (специфичные
+ * виды режиссёра — раньше общего "Режиссер", иначе "Режиссер повторов" сам
+ * попал бы под общий), а порядок вывода на доске — по rank, отдельно от
+ * порядка проверки. Прод -> Реж -> Повт -> Титры -> Звук -> Инж -> (операторы,
+ * они всегда последними и обрабатываются отдельно).
+ */
+const ROLE_RANK_RULES = [
+  { pattern: 'Продюсер', rank: 0 },
+  { pattern: 'Режиссер повторов', rank: 2 },
+  { pattern: 'Режиссер графики', rank: 3 },
+  { pattern: 'Звукорежиссер', rank: 4 },
+  { pattern: 'Инженер', rank: 5 },
+  { pattern: 'Режиссер', rank: 1 }, // общий (много-/однокамерного эфира)
 ];
 
 function roleSortRank_(lineName) {
-  const idx = ROLE_SORT_KEYWORDS.findIndex(k => lineName && lineName.includes(k));
-  return idx === -1 ? ROLE_SORT_KEYWORDS.length : idx;
+  const rule = ROLE_RANK_RULES.find(r => lineName && lineName.includes(r.pattern));
+  return rule ? rule.rank : 99;
 }
 
 const BOARD_PINK = '#f4cccc';
@@ -722,6 +729,30 @@ function amplua_(lineName) {
   return key ? AMPLUA_ABBR[key] : lineName;
 }
 
+/** Доп.услуги с нужными short_name, привязанные к этой конкретной строке (line). */
+function additionalServiceShortNames_(line, wantedShortNames) {
+  const at = line.assignment_technical;
+  const list = (at && at.event_service_additional_service_list) || [];
+  return list
+    .map(x => x.additional_service && x.additional_service.short_name)
+    .filter(sn => sn && wantedShortNames.includes(sn));
+}
+
+/**
+ * Подпись роли на доске: сокращение амплуа, и для "Режиссера графики" —
+ * с добавлением GTZp/БК, если такая доп.услуга привязана именно к этой строке
+ * (у графики это обычные партнёры по задаче — свои системы вывода графики).
+ */
+function roleLabel_(line) {
+  const name = line.line ? line.line.name : '';
+  let label = amplua_(name);
+  if (name.includes('Режиссер графики')) {
+    const badges = additionalServiceShortNames_(line, ['GTZp', 'БК']);
+    if (badges.length > 0) label += ' ' + badges.join('/');
+  }
+  return label;
+}
+
 function executorName_(line) {
   const at = line.assignment_technical;
   if (at && at.employee) return `${at.employee.last_name} ${at.employee.first_name}`.trim();
@@ -836,7 +867,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
 
   let row = startRow + 1;
   for (const line of roleLines) {
-    sheet.getRange(row, col).setValue(amplua_(line.line ? line.line.name : ''));
+    sheet.getRange(row, col).setValue(roleLabel_(line));
     const cell = sheet.getRange(row, col + 1).setBackground(BOARD_PINK);
     const executor = executorName_(line);
     if (executor) {
