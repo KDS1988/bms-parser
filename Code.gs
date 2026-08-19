@@ -68,6 +68,7 @@ function onOpen() {
     .addItem('🔬 Дамп структуры выделенных ячеек (для отладки доски)', 'debugDumpSelection')
     .addItem('🧹 Сбросить реестр положений на доске', 'resetBoardState')
     .addItem('🔍 Найти замену по ID мероприятия...', 'findReplacementsManually')
+    .addItem('📝 Перенести черновики в BMS...', 'scanDraftAssignments')
     .addItem('✏️ Добавить мероприятие на доску вручную', 'addManualEntry')
     .addToUi();
 }
@@ -213,6 +214,53 @@ function bmsGet_(path, params) {
     }
   }
   throw lastError;
+}
+
+/**
+ * POST в BMS API. Без ретраев на сетевые сбои (в отличие от bmsGet_) —
+ * это запись реальных данных, при неясном исходе (таймаут и т.п.) лучше явно
+ * упасть с ошибкой, чем рискнуть создать назначение дважды повторным запросом.
+ */
+function bmsPost_(path, body) {
+  const accessToken = getAccessToken_();
+  const url = `${CONFIG.BMS_API}/${path}`;
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      origin: 'https://bms.vsporte.ru',
+      referer: 'https://bms.vsporte.ru/',
+    },
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true,
+  });
+
+  const code = resp.getResponseCode();
+  if (code !== 200 && code !== 201) {
+    throw new Error(`BMS API POST ${path} -> ${code}: ${resp.getContentText()}`);
+  }
+  return JSON.parse(resp.getContentText());
+}
+
+/**
+ * Назначает сотрудника на конкретную строку услуги в BMS.
+ * eventServiceId — item.id (event_service_id), eventServiceLineId — line.id
+ * из event_service_lines (НЕ line.line.id — это id каталожного амплуа, а
+ * нужен id конкретной строки-назначения внутри этой услуги).
+ */
+function assignEmployeeInBms_(eventServiceId, eventServiceLineId, employeeId) {
+  return bmsPost_('projects/assignment/technical', {
+    comment: '',
+    dismantling: false,
+    employee_id: employeeId,
+    event_service_additional_service_list: [],
+    event_service_id: eventServiceId,
+    event_service_line_id: eventServiceLineId,
+    installation: false,
+    logistics: null,
+    event_service_video_task_list: [],
+  });
 }
 
 /** Собирает все мероприятия на ближайшие LOOKAHEAD_DAYS дней (все страницы). */
@@ -1276,6 +1324,152 @@ function notifyReplacementCandidates_(event, item, declinedLine) {
   sendTelegramMessage_(header.concat(body).join('\n'));
 }
 
+// ============================== ЧЕРНОВИКИ ДЛЯ ПЕРЕНОСА В BMS ==============================
+
+/**
+ * Ищет всех сотрудников из графика персонала (_staff_schedule_raw) с этим
+ * амплуа, чьё full_name начинается с заданного префикса (без учёта отчества).
+ */
+/**
+ * Ищет всех сотрудников из графика персонала (_staff_schedule_raw) с этим
+ * амплуа, чьё full_name начинается с заданного префикса. Дедуп по паре
+ * "имя+телефон", а не только по имени — если совпадение имени, но телефоны
+ * разные, это настоящие тёзки (два разных человека), а не один и тот же
+ * сотрудник, встреченный дважды — их нужно вернуть ОБОИХ, чтобы дальше это
+ * ушло в разряд "неоднозначно", а не тихо схлопнулось в одного наугад.
+ */
+function findStaffByNamePrefix_(lineName, prefix) {
+  const raw = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(STAFF_RAW_SHEET_NAME);
+  if (!raw || raw.getLastRow() < 2) return [];
+  const data = raw.getRange(2, 1, raw.getLastRow() - 1, 9).getValues();
+  const seen = {};
+  const results = [];
+  for (const r of data) {
+    const [line, , fullName, phone, , , , , employeeId] = r;
+    if (line !== lineName) continue;
+    if (!fullName || !fullName.startsWith(prefix)) continue;
+    const dedupKey = `${fullName}::${phone}`;
+    if (seen[dedupKey]) continue;
+    seen[dedupKey] = true;
+    results.push({ fullName, phone, employeeId });
+  }
+  return results;
+}
+
+/**
+ * Смотрит на текст в ячейке исполнителя (для роли, которая в BMS всё ещё
+ * not_appointed). Если текст — два слова в порядке "Имя Фамилия" (обратном
+ * тому, что везде использует наш код и сама BMS — "Фамилия Имя") и совпадает
+ * с реальным сотрудником из графика персонала по этому же амплуа — считаем
+ * это черновиком для переноса в BMS. Если текст уже в порядке "Фамилия Имя" —
+ * не трогаем (либо уже синхронизировано, либо инертный черновик в привычном виде).
+ *
+ * Возвращает: null (не наш случай), {fullName, phone} (однозначное совпадение),
+ * или {ambiguous: true, candidates: [...]} (несколько совпадений сразу).
+ */
+function detectDraftAssignment_(cellText, lineName) {
+  const parts = String(cellText || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length !== 2) return null; // работаем только с простым "Имя Фамилия" в два слова
+
+  const [w1, w2] = parts;
+  const asIs = `${w1} ${w2}`;
+  const swapped = `${w2} ${w1}`;
+
+  if (findStaffByNamePrefix_(lineName, asIs).length > 0) {
+    return null; // уже в привычном порядке "Фамилия Имя" — не трогаем
+  }
+
+  const swappedMatches = findStaffByNamePrefix_(lineName, swapped);
+  if (swappedMatches.length === 1) {
+    return swappedMatches[0];
+  }
+  if (swappedMatches.length > 1) {
+    return { ambiguous: true, candidates: swappedMatches };
+  }
+  return null; // не нашли ни разу — не похоже на реального сотрудника
+}
+
+/**
+ * ПРОВЕРОЧНАЯ функция (не пишет в BMS — этого шага пока нет, ждём HAR с
+ * реальным запросом назначения). Проходит по всем 'full'-блокам на доске за
+ * LOOKAHEAD_DAYS, для каждой ещё не назначенной в BMS роли смотрит текущий
+ * текст в ячейке и проверяет detectDraftAssignment_. Результат — в Telegram.
+ */
+/**
+ * Проходит по всем 'full'-блокам на доске за LOOKAHEAD_DAYS, для каждой ещё
+ * не назначенной в BMS роли смотрит текущий текст в ячейке. Однозначные
+ * черновики ("Имя Фамилия", совпадающие с реальным сотрудником по этому же
+ * амплуа) — СРАЗУ ПРИМЕНЯЕТ в BMS (реальная запись, см. assignEmployeeInBms_).
+ * Неоднозначные (несколько тёзок) — не трогает, только сообщает.
+ */
+function scanDraftAssignments() {
+  const ui = SpreadsheetApp.getUi();
+  const items = fetchUpcomingAssignments_();
+  const boardStateMap = getBoardStateMap_();
+  const found = [];
+  const ambiguous = [];
+
+  for (const item of items) {
+    if (!item.service || !CONFIG.TARGET_SERVICES.includes(item.service.name)) continue;
+    const boardState = boardStateMap[String(item.id)];
+    if (!boardState || boardState.kind !== 'full') continue; // блока подрядчика это не касается
+
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(boardState.sheetName);
+    if (!sheet) continue;
+
+    const { roleLines, cameraLines } = classifyLines_(item);
+    let row = boardState.startRow + 1;
+    for (const line of roleLines.concat(cameraLines)) {
+      if (!executorName_(line)) { // роль ещё не назначена в BMS — тут может быть черновик
+        const cellText = sheet.getRange(row, boardState.col + 1).getValue();
+        const lineName = line.line ? line.line.name : '';
+        const result = detectDraftAssignment_(cellText, lineName);
+        if (result && result.ambiguous) {
+          ambiguous.push({ event: item.event, line: lineName, cellText, candidates: result.candidates });
+        } else if (result) {
+          found.push({
+            event: item.event, line: lineName, cellText, match: result,
+            eventServiceId: item.id, eventServiceLineId: line.id,
+            cell: sheet.getRange(row, boardState.col + 1),
+          });
+        }
+      }
+      row++;
+    }
+  }
+
+  if (found.length === 0 && ambiguous.length === 0) {
+    ui.alert('Черновиков для переноса не найдено.');
+    return;
+  }
+
+  const applied = [];
+  const failed = [];
+  for (const f of found) {
+    try {
+      assignEmployeeInBms_(f.eventServiceId, f.eventServiceLineId, f.match.employeeId);
+      f.cell.setValue(f.match.fullName); // приводим к обычному виду "Фамилия Имя", как из BMS
+      applied.push(f);
+    } catch (e) {
+      failed.push({ ...f, error: String(e) });
+    }
+  }
+
+  const lines = ['📝 <b>Черновики перенесены в BMS</b>', ''];
+  applied.forEach(f => {
+    lines.push(`✅ ${f.event.date} ${eventDisplayName_(f.event)}\n${amplua_(f.line)}: "${f.cellText}" → ${f.match.fullName}${f.match.phone ? ' (' + f.match.phone + ')' : ''}`);
+  });
+  failed.forEach(f => {
+    lines.push(`❌ ${f.event.date} ${eventDisplayName_(f.event)}\n${amplua_(f.line)}: "${f.cellText}" → ошибка записи: ${f.error}`);
+  });
+  ambiguous.forEach(a => {
+    lines.push(`⚠️ ${a.event.date} ${eventDisplayName_(a.event)}\n${amplua_(a.line)}: "${a.cellText}" → неоднозначно (${a.candidates.map(c => c.fullName).join(', ')})`);
+  });
+
+  sendTelegramMessage_(lines.join('\n\n'));
+  ui.alert(`Готово. Применено: ${applied.length}, ошибок: ${failed.length}, неоднозначных: ${ambiguous.length}. Подробности в Telegram.`);
+}
+
 function formatChangeMessage_(event, item, changes) {
   const teams = eventDisplayName_(event);
   return [
@@ -1459,7 +1653,7 @@ function fetchAndCacheStaffSchedule_(dateFrom, dateTo) {
     raw = ss.insertSheet(STAFF_RAW_SHEET_NAME);
     raw.hideSheet();
   }
-  raw.appendRow(['line', 'category', 'full_name', 'phone', 'title', 'dept', 'date', 'cell_text']);
+  raw.appendRow(['line', 'category', 'full_name', 'phone', 'title', 'dept', 'date', 'cell_text', 'employee_id']);
 
   const rows = [];
   for (const line of lines) {
@@ -1482,14 +1676,14 @@ function fetchAndCacheStaffSchedule_(dateFrom, dateTo) {
       (entry.days || []).forEach(d => { daysByDate[d.date] = d; });
 
       for (const d of dates) {
-        rows.push([line.name, category ? category.category : '', fullName, phone, title, dept, d, dayCellValue_(daysByDate[d])]);
+        rows.push([line.name, category ? category.category : '', fullName, phone, title, dept, d, dayCellValue_(daysByDate[d]), emp.id]);
       }
     }
     Utilities.sleep(150); // не долбим API слишком часто — 31 амплуа подряд
   }
 
   if (rows.length > 0) {
-    raw.getRange(2, 1, rows.length, 8).setValues(rows);
+    raw.getRange(2, 1, rows.length, 9).setValues(rows);
   }
 
   PropertiesService.getScriptProperties().setProperty(
