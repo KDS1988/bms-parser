@@ -26,9 +26,24 @@ const CONFIG = {
   // услуги, чей тех.блок нас интересует (сравнение по service.name)
   TARGET_SERVICES: ['Прямая трансляция', 'Студия'],
 
+  // лиги/категории, которые полностью пропускаем (доска + "Тех блок") — не
+  // отдельные мероприятия, а целая категория. ХЛТР — однокамерные трансляции,
+  // их слишком много, чтобы класть на доску наравне с обычными матчами.
+  EXCLUDED_LEAGUES: ['ХЛТР'],
+
   // горизонт, на который смотрим вперёд при опросе (дней)
   LOOKAHEAD_DAYS: 60,
 };
+
+/** Проверяет, нужно ли вообще обрабатывать эту услугу для доски/"Тех блок"
+ * (нужная услуга + не в списке исключённых лиг). Единая точка правды —
+ * используется везде, где раньше был отдельный CONFIG.TARGET_SERVICES.includes(). */
+function isTargetItem_(item) {
+  if (!item.service || !CONFIG.TARGET_SERVICES.includes(item.service.name)) return false;
+  const leagueShort = item.event && item.event.league ? item.event.league.short_name : null;
+  if (leagueShort && CONFIG.EXCLUDED_LEAGUES.includes(leagueShort)) return false;
+  return true;
+}
 
 // ============================== СЕКРЕТЫ (Script Properties) ==============================
 // Токен бота, номер телефона и chat_id — НЕ в коде (чтобы не улетели в git), а в
@@ -484,9 +499,7 @@ function test_FillTechBlockForAllCurrentEvents() {
   let written = 0;
 
   for (const { event, items } of entries) {
-    const targetItems = items.filter(it =>
-      it.service && CONFIG.TARGET_SERVICES.includes(it.service.name)
-    );
+    const targetItems = items.filter(isTargetItem_);
     for (const item of targetItems) {
       try {
         appendTechBlockRows_(event, item);
@@ -1067,7 +1080,7 @@ function findReplacementsManually() {
 
   let sent = 0;
   for (const item of matches) {
-    if (!item.service || !CONFIG.TARGET_SERVICES.includes(item.service.name)) continue;
+    if (!isTargetItem_(item)) continue;
     const declinedLines = lineSignature_(item).filter(l => l.status === 'declined');
     for (const line of declinedLines) {
       notifyReplacementCandidates_(matches[0].event, item, line);
@@ -1342,6 +1355,13 @@ function notifyReplacementCandidates_(event, item, declinedLine) {
  * сотрудник, встреченный дважды — их нужно вернуть ОБОИХ, чтобы дальше это
  * ушло в разряд "неоднозначно", а не тихо схлопнулось в одного наугад.
  */
+/** Обрезает "Фамилия Имя Отчество" до "Фамилия Имя" — так везде выглядят
+ * исполнители на доске, отчество там не нужно. */
+function shortName_(fullName) {
+  const parts = String(fullName || '').trim().split(/\s+/);
+  return parts.slice(0, 2).join(' ');
+}
+
 function findStaffByNamePrefix_(lineName, prefix) {
   const raw = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(STAFF_RAW_SHEET_NAME);
   if (!raw || raw.getLastRow() < 2) return [];
@@ -1414,7 +1434,7 @@ function scanDraftAssignments() {
   const ambiguous = [];
 
   for (const item of items) {
-    if (!item.service || !CONFIG.TARGET_SERVICES.includes(item.service.name)) continue;
+    if (!isTargetItem_(item)) continue;
     const boardState = boardStateMap[String(item.id)];
     if (!boardState || boardState.kind !== 'full') continue; // блока подрядчика это не касается
 
@@ -1452,7 +1472,7 @@ function scanDraftAssignments() {
   for (const f of found) {
     try {
       assignEmployeeInBms_(f.eventServiceId, f.eventServiceLineId, f.match.employeeId);
-      f.cell.setValue(f.match.fullName); // приводим к обычному виду "Фамилия Имя", как из BMS
+      f.cell.setValue(shortName_(f.match.fullName)); // приводим к обычному виду "Фамилия Имя", как из BMS (без отчества)
       applied.push(f);
     } catch (e) {
       failed.push({ ...f, error: String(e) });
@@ -1499,7 +1519,7 @@ function test_WriteBoardForEvent() {
   }
   const boardStateMap = getBoardStateMap_();
   for (const item of matches) {
-    if (item.service && CONFIG.TARGET_SERVICES.includes(item.service.name)) {
+    if (isTargetItem_(item)) {
       const { isNew, changes } = upsertMatchBlock_(item.event, item, boardStateMap);
       Logger.log(`event_id=${EVENT_ID}, service=${item.service.name}, isNew=${isNew}, changes=${JSON.stringify(changes)}`);
     }
@@ -1538,9 +1558,7 @@ function test_WriteBoardForDate() {
   const boardStateMap = getBoardStateMap_();
   let written = 0;
   for (const { event, items: evItems } of entries) {
-    const targetItems = evItems.filter(it =>
-      it.service && CONFIG.TARGET_SERVICES.includes(it.service.name)
-    );
+    const targetItems = evItems.filter(isTargetItem_);
     for (const item of targetItems) {
       upsertMatchBlock_(event, item, boardStateMap);
       written++;
@@ -1842,9 +1860,7 @@ function processEventEntry_(event, items, seenEvents, boardStateMap) {
     markEventSeen_(event.id);
   }
 
-  const targetItems = items.filter(it =>
-    it.service && CONFIG.TARGET_SERVICES.includes(it.service.name)
-  );
+  const targetItems = items.filter(isTargetItem_);
 
   for (const item of targetItems) {
     let result;
@@ -1872,11 +1888,16 @@ function processEventEntry_(event, items, seenEvents, boardStateMap) {
       );
     }
 
-    for (const declinedLine of (result.isNew ? [] : result.newlyDeclined)) {
+    for (const declinedLine of result.newlyDeclined) {
       try {
         notifyReplacementCandidates_(event, item, declinedLine);
       } catch (e) {
         Logger.log(`Не удалось подобрать замену event_id=${event.id}, line=${declinedLine.name}: ${e}`);
+        try {
+          sendTelegramMessage_(
+            `⚠️ Отказ от назначения (${event.date} ${eventDisplayName_(event)}, ${amplua_(declinedLine.name)}) обнаружен, но подбор замены упал с ошибкой: ${e}`
+          );
+        } catch (e2) { /* если и это не ушло — сдаёмся молча, дальше уже некуда */ }
       }
     }
   }
