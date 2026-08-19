@@ -777,10 +777,15 @@ function amplua_(lineName) {
   return key ? AMPLUA_ABBR[key] : lineName;
 }
 
-/** Доп.услуги с нужными short_name, привязанные к этой конкретной строке (line). */
-function additionalServiceShortNames_(line, wantedShortNames) {
-  const at = line.assignment_technical;
-  const list = (at && at.event_service_additional_service_list) || [];
+/**
+ * Доп.услуги с нужными short_name, заявленные на уровне ВСЕЙ услуги (item.
+ * additional_services — то, что менеджер отметил как нужное для услуги в
+ * целом). Не путать с assignment_technical.event_service_additional_service_list
+ * у конкретной строки — та привязка появляется только после назначения
+ * человека и относится к его конкретной оплате, а не к декларации на услуге.
+ */
+function additionalServiceShortNames_(item, wantedShortNames) {
+  const list = item.additional_services || [];
   return list
     .map(x => x.additional_service && x.additional_service.short_name)
     .filter(sn => sn && wantedShortNames.includes(sn));
@@ -788,14 +793,13 @@ function additionalServiceShortNames_(line, wantedShortNames) {
 
 /**
  * Подпись роли на доске: сокращение амплуа, и для "Режиссера графики" —
- * с добавлением GTZp/БК, если такая доп.услуга привязана именно к этой строке
- * (у графики это обычные партнёры по задаче — свои системы вывода графики).
+ * с добавлением GTZp/БК, если такая доп.услуга заявлена на самой услуге.
  */
-function roleLabel_(line) {
+function roleLabel_(line, item) {
   const name = line.line ? line.line.name : '';
   let label = amplua_(name);
   if (name.includes('Режиссер графики')) {
-    const badges = additionalServiceShortNames_(line, ['GTZp', 'БК']);
+    const badges = additionalServiceShortNames_(item, ['GTZp', 'БК']);
     if (badges.length > 0) label += ' ' + badges.join('/');
   }
   return label;
@@ -915,7 +919,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
 
   let row = startRow + 1;
   for (const line of roleLines) {
-    sheet.getRange(row, col).setValue(roleLabel_(line));
+    sheet.getRange(row, col).setValue(roleLabel_(line, item));
     const cell = sheet.getRange(row, col + 1).setBackground(BOARD_PINK);
     const executor = executorName_(line);
     if (executor) {
