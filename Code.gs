@@ -36,12 +36,15 @@ const CONFIG = {
 };
 
 /** Проверяет, нужно ли вообще обрабатывать эту услугу для доски/"Тех блок"
- * (нужная услуга + не в списке исключённых лиг). Единая точка правды —
- * используется везде, где раньше был отдельный CONFIG.TARGET_SERVICES.includes(). */
+ * (нужная услуга + не в списке исключённых лиг/проектов). Единая точка
+ * правды — используется везде, где раньше был отдельный
+ * CONFIG.TARGET_SERVICES.includes(). */
 function isTargetItem_(item) {
   if (!item.service || !CONFIG.TARGET_SERVICES.includes(item.service.name)) return false;
   const leagueShort = item.event && item.event.league ? item.event.league.short_name : null;
   if (leagueShort && CONFIG.EXCLUDED_LEAGUES.includes(leagueShort)) return false;
+  const projectName = item.project ? item.project.name : null;
+  if (projectName && CONFIG.EXCLUDED_PROJECTS.some(p => projectName.includes(p))) return false;
   return true;
 }
 
@@ -79,6 +82,7 @@ function onOpen() {
     .addItem('🧪 Тест: заполнить "Тех блок" по текущим данным', 'test_FillTechBlockForAllCurrentEvents')
     .addItem('🧪 Тест: записать на доску (event 14175)', 'test_WriteBoardForEvent')
     .addItem('▶ Записать на доску дату...', 'test_WriteBoardForDate')
+    .addItem('📅 Записать на доску месяц целиком...', 'writeBoardForMonth')
     .addItem('📋 Обновить график персонала сейчас', 'refreshStaffScheduleNow')
     .addItem('🔬 Дамп структуры выделенных ячеек (для отладки доски)', 'debugDumpSelection')
     .addItem('🧹 Сбросить реестр положений на доске', 'resetBoardState')
@@ -278,13 +282,8 @@ function assignEmployeeInBms_(eventServiceId, eventServiceLineId, employeeId) {
   });
 }
 
-/** Собирает все мероприятия на ближайшие LOOKAHEAD_DAYS дней (все страницы). */
-function fetchUpcomingAssignments_() {
-  const today = new Date();
-  const dateFrom = Utilities.formatDate(today, 'Europe/Moscow', 'yyyy-MM-dd');
-  const until = new Date(today.getTime() + CONFIG.LOOKAHEAD_DAYS * 86400000);
-  const dateTo = Utilities.formatDate(until, 'Europe/Moscow', 'yyyy-MM-dd');
-
+/** Собирает все мероприятия за произвольный диапазон дат (все страницы). */
+function fetchAssignmentsForRange_(dateFrom, dateTo) {
   let items = [];
   let page = 1;
   while (true) {
@@ -299,6 +298,15 @@ function fetchUpcomingAssignments_() {
     Utilities.sleep(300); // небольшая пауза между страницами, снижает шанс DNS/сетевых сбоев
   }
   return items;
+}
+
+/** Собирает все мероприятия на ближайшие LOOKAHEAD_DAYS дней (все страницы). */
+function fetchUpcomingAssignments_() {
+  const today = new Date();
+  const dateFrom = Utilities.formatDate(today, 'Europe/Moscow', 'yyyy-MM-dd');
+  const until = new Date(today.getTime() + CONFIG.LOOKAHEAD_DAYS * 86400000);
+  const dateTo = Utilities.formatDate(until, 'Europe/Moscow', 'yyyy-MM-dd');
+  return fetchAssignmentsForRange_(dateFrom, dateTo);
 }
 
 // ============================== РЕЕСТР ОБРАБОТАННЫХ ==============================
@@ -620,6 +628,12 @@ function getOrCreateMonthSheet_(dateStr) {
 }
 
 /** Строка серой шапки для даты — из динамической карты (не арифметика, т.к. дни могут вырасти). */
+/** Строка серой шапки для даты — из динамической карты (не арифметика, т.к.
+ * дни могут вырасти). Дополнительно проверяет, что шапка там ДЕЙСТВИТЕЛЬНО
+ * нарисована (не только полагается на карту) — если лист когда-либо создался
+ * в обход обычного пути (например, гонка между двумя почти одновременными
+ * записями), карта могла не совпасть с реальным состоянием листа, и шапка для
+ * части дней просто не нарисовалась бы. Самовосстанавливается на лету. */
 function findOrCreateDateHeaderRow_(sheet, dateStr) {
   const d = new Date(dateStr);
   const day = d.getDate();
@@ -633,7 +647,19 @@ function findOrCreateDateHeaderRow_(sheet, dateStr) {
     for (let dd = 1; dd <= total; dd++) map[dd] = 1 + (dd - 1) * DEFAULT_DAY_ROWS;
     saveDayRowMap_(sheet.getName(), map);
   }
-  return map[day];
+
+  const headerRow = map[day];
+  const headerCell = sheet.getRange(headerRow, 1);
+  if (headerCell.getBackground() !== BOARD_GRAY) {
+    const shortDate = Utilities.formatDate(d, 'Europe/Moscow', 'dd.MM');
+    const weekday = WEEKDAYS_RU[d.getDay()];
+    sheet.getRange(headerRow, 1, 1, BOARD_HEADER_WIDTH).setBackground(BOARD_GRAY);
+    sheet.getRange(headerRow, 1).setNumberFormat('@STRING@')
+      .setValue(shortDate).setFontWeight('bold').setFontColor('#ffffff');
+    sheet.getRange(headerRow, 2).setValue(weekday).setFontColor('#ffffff');
+  }
+
+  return headerRow;
 }
 
 /**
@@ -694,42 +720,48 @@ function bumpBoardStateHeaderRows_(sheetName, afterHeaderRow, delta, boardStateM
 /**
  * Ищет первую свободную группу колонок (ширина BOARD_GROUP_WIDTH) в строке,
  * начиная с B. Колонка считается занятой, если непуста ячейка с командой/
- * описанием (col+1) ИЛИ если её для этого дня уже застолбил столбик
- * подрядчиков (CSTACK). Проверяем именно col+1, а не col (лига) — у части
- * мероприятий (например, соревнования без структурированной лиги в BMS)
- * ячейка с лигой законно пустая, и раньше это заставляло код считать занятую
- * колонку свободной — из-за чего новые блоки садились поверх старых.
+ * описанием (col+1) ИЛИ если её для этого дня уже застолбил ЛЮБОЙ столбик
+ * (подрядчиков или "маленьких блоков по проекту") — даже если конкретная
+ * верхняя ячейка сейчас выглядит пустой (например, столбик переехал оттуда).
+ * Проверяем именно col+1, а не col (лига) — у части мероприятий (например,
+ * соревнования без структурированной лиги) ячейка с лигой законно пустая.
  */
 function findFreeColumnGroup_(sheet, row, day) {
-  const reservedByStack = day != null
-    ? getStackReservedCol_(sheet.getName(), day)
-    : null;
+  const reserved = day != null ? getAllStackReservedCols_(sheet.getName(), day) : new Set();
 
   let col = 2; // B
-  while (sheet.getRange(row, col + 1).getValue() !== '' || col === reservedByStack) {
+  while (sheet.getRange(row, col + 1).getValue() !== '' || reserved.has(col)) {
     col += BOARD_GROUP_WIDTH;
   }
   return col;
 }
 
-/** Колонка, которую для этого дня держит столбик подрядчиков (если есть). */
-function getStackReservedCol_(sheetName, day) {
-  const raw = PropertiesService.getScriptProperties().getProperty(`CSTACK::${sheetName}::day${day}`);
-  return raw ? JSON.parse(raw).col : null;
+/** Все колонки, занятые ЛЮБЫМИ столбиками (по любому groupKey) для этого дня. */
+function getAllStackReservedCols_(sheetName, day) {
+  const prefix = `STACK::${sheetName}::day${day}::`;
+  const props = PropertiesService.getScriptProperties().getProperties();
+  const cols = new Set();
+  Object.keys(props).forEach(key => {
+    if (key.startsWith(prefix)) {
+      try { cols.add(JSON.parse(props[key]).col); } catch (e) { /* мусор в properties — игнорируем */ }
+    }
+  });
+  return cols;
 }
 
 /**
- * Резервирует место для очередного КОМПАКТНОГО (подрядчик) блока: если в этот
- * день уже есть "столбик" подрядчиков с местом до конца дня — ставим следующим
- * под предыдущим (2 строки на запись). Если места нет или столбика ещё нет —
- * начинаем новую группу колонок. Позиция столбика хранится в Script Properties,
- * ключ — по номеру ДНЯ (не строки!): строка-шапка дня может сдвинуться вниз,
- * если раньше в этом же месяце другому мероприятию понадобилось больше места —
- * а номер дня месяца от этого не меняется.
+ * Резервирует место в столбике под groupKey (например 'contractor' для
+ * подрядчиков, или `project:НазваниеПроекта` для мелких блоков одного
+ * проекта): если в этот день такой столбик уже есть и в нём хватает места —
+ * ставим следующим под предыдущим (blockRows строк на запись). Если места
+ * нет или столбика ещё нет — начинаем новую группу колонок. Позиция хранится
+ * в Script Properties, ключ — по номеру ДНЯ (не строки!): строка-шапка дня
+ * может сдвинуться вниз, если раньше в этом же месяце другому мероприятию
+ * понадобилось больше места — а номер дня месяца от этого не меняется.
  */
-function reserveContractorSlot_(sheet, day, headerRow) {
+function reserveStackSlot_(sheet, day, headerRow, groupKey, blockRows) {
   const sheetName = sheet.getName();
-  const stackKey = `CSTACK::${sheetName}::day${day}`;
+  const stackKey = `STACK::${sheetName}::day${day}::${groupKey}`;
   const props = PropertiesService.getScriptProperties();
   const raw = props.getProperty(stackKey);
   const stack = raw ? JSON.parse(raw) : null;
@@ -739,7 +771,7 @@ function reserveContractorSlot_(sheet, day, headerRow) {
   const dayBottom = nextHeaderRow ? nextHeaderRow - 1 : headerRow + DEFAULT_DAY_ROWS - 1;
 
   let col, startRow;
-  if (stack && (stack.nextRow + 1) <= dayBottom) {
+  if (stack && (stack.nextRow + blockRows - 1) <= dayBottom) {
     col = stack.col;
     startRow = stack.nextRow;
   } else {
@@ -747,8 +779,14 @@ function reserveContractorSlot_(sheet, day, headerRow) {
     startRow = headerRow + 1;
   }
 
-  props.setProperty(stackKey, JSON.stringify({ col, nextRow: startRow + 2 }));
+  props.setProperty(stackKey, JSON.stringify({ col, nextRow: startRow + blockRows }));
   return { col, startRow };
+}
+
+/** Столбик подрядчиков — частный случай reserveStackSlot_ с фиксированным
+ * groupKey и высотой ровно 2 строки (заголовок + имя подрядчика). */
+function reserveContractorSlot_(sheet, day, headerRow) {
+  return reserveStackSlot_(sheet, day, headerRow, 'contractor', 2);
 }
 
 /**
@@ -1052,7 +1090,7 @@ function resetBoardState() {
   const props = PropertiesService.getScriptProperties();
   const all = props.getProperties();
   Object.keys(all).forEach(key => {
-    if (key.startsWith('CSTACK::')) props.deleteProperty(key);
+    if (key.startsWith('CSTACK::') || key.startsWith('STACK::')) props.deleteProperty(key);
   });
 
   ui.alert('Готово, реестр и столбики подрядчиков сброшены.');
@@ -1244,7 +1282,7 @@ function upsertMatchBlock_(event, item, boardStateMap) {
     }
   }
 
-  const { kind } = classifyLines_(item);
+  const { kind, roleLines, cameraLines } = classifyLines_(item);
 
   const samePlace = existing
     && existing.sheetName === sheet.getName()
@@ -1260,8 +1298,19 @@ function upsertMatchBlock_(event, item, boardStateMap) {
     if (kind === 'contractor') {
       ({ col, startRow } = reserveContractorSlot_(sheet, day, headerRow));
     } else {
-      col = findFreeColumnGroup_(sheet, headerRow + 1, day);
-      startRow = headerRow + 1;
+      // Маленькие блоки (не больше 4 строк) одного проекта в рамках дня —
+      // тоже укладываем в столбик, как подрядчиков, вместо отдельной колонки
+      // на каждый. Если блок вырастет позже — ensureRoomForBlock_ раздвинет
+      // строки на листе физически, но сам столбик об этом не узнает: это
+      // приемлемое ограничение, крупных блоков в столбик обычно не попадает.
+      const neededRows = 1 + roleLines.length + cameraLines.length;
+      const projectName = item.project ? item.project.name : null;
+      if (projectName && neededRows <= 4) {
+        ({ col, startRow } = reserveStackSlot_(sheet, day, headerRow, `project:${projectName}`, neededRows));
+      } else {
+        col = findFreeColumnGroup_(sheet, headerRow + 1, day);
+        startRow = headerRow + 1;
+      }
     }
   }
 
@@ -1567,7 +1616,62 @@ function test_WriteBoardForDate() {
   ui.alert(`Готово. Записано/обновлено блоков: ${written}`);
 }
 
-/** Принимает "26.09.2026" или "2026-09-26", возвращает "2026-09-26" (формат BMS) или null. */
+/**
+ * Записывает/обновляет ВЕСЬ месяц на доске за один вызов — в отличие от
+ * "Записать на доску дату", тут диапазон дат произвольный (не ограничен
+ * ближайшими LOOKAHEAD_DAYS), можно указать прошедший месяц. Не шлёт
+ * уведомления в Telegram — для массовой пересборки/ретроспективного парсинга.
+ */
+function writeBoardForMonth() {
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.prompt(
+    'Записать месяц на доску',
+    'Какой месяц? (например 07.2026 или 2026-07)',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+
+  const parsed = parseMonthInput_(resp.getResponseText().trim());
+  if (!parsed) {
+    ui.alert('Не понял месяц: ' + resp.getResponseText());
+    return;
+  }
+  const { year, month0 } = parsed;
+
+  const dateFrom = Utilities.formatDate(new Date(year, month0, 1), 'Europe/Moscow', 'yyyy-MM-dd');
+  const lastDay = daysInMonth_(year, month0);
+  const dateTo = Utilities.formatDate(new Date(year, month0, lastDay), 'Europe/Moscow', 'yyyy-MM-dd');
+
+  const items = fetchAssignmentsForRange_(dateFrom, dateTo);
+  const entries = groupByEvent_(items);
+
+  if (entries.length === 0) {
+    ui.alert(`За ${dateFrom} — ${dateTo} мероприятий не найдено в BMS.`);
+    return;
+  }
+
+  const boardStateMap = getBoardStateMap_();
+  let written = 0;
+  for (const { event, items: evItems } of entries) {
+    const targetItems = evItems.filter(isTargetItem_);
+    for (const item of targetItems) {
+      upsertMatchBlock_(event, item, boardStateMap);
+      written++;
+    }
+  }
+  ui.alert(`Готово. Записано/обновлено блоков: ${written} за ${dateFrom} — ${dateTo}.`);
+}
+
+/** Принимает "07.2026" или "2026-07", возвращает {year, month0} (month0 — с 0) или null. */
+function parseMonthInput_(raw) {
+  let m = raw.match(/^(\d{4})-(\d{1,2})$/); // 2026-07
+  if (m) return { year: Number(m[1]), month0: Number(m[2]) - 1 };
+  m = raw.match(/^(\d{1,2})\.(\d{4})$/); // 07.2026
+  if (m) return { year: Number(m[2]), month0: Number(m[1]) - 1 };
+  return null;
+}
+
+
 function parseDateInput_(raw) {
   let m = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (m) return raw;
