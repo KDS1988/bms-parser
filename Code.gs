@@ -29,6 +29,7 @@ const CONFIG = {
   // лиги/категории, которые полностью пропускаем (доска + "Тех блок") — не
   // отдельные мероприятия, а целая категория. ХЛТР — однокамерные трансляции,
   // их слишком много, чтобы класть на доску наравне с обычными матчами.
+  // ФХМ — тоже отдельная категория, не нужная на доске.
   EXCLUDED_LEAGUES: ['ХЛТР', 'ФХМ'],
 
   // горизонт, на который смотрим вперёд при опросе (дней)
@@ -36,15 +37,12 @@ const CONFIG = {
 };
 
 /** Проверяет, нужно ли вообще обрабатывать эту услугу для доски/"Тех блок"
- * (нужная услуга + не в списке исключённых лиг/проектов). Единая точка
- * правды — используется везде, где раньше был отдельный
- * CONFIG.TARGET_SERVICES.includes(). */
+ * (нужная услуга + не в списке исключённых лиг). Единая точка правды —
+ * используется везде, где раньше был отдельный CONFIG.TARGET_SERVICES.includes(). */
 function isTargetItem_(item) {
   if (!item.service || !CONFIG.TARGET_SERVICES.includes(item.service.name)) return false;
   const leagueShort = item.event && item.event.league ? item.event.league.short_name : null;
   if (leagueShort && CONFIG.EXCLUDED_LEAGUES.includes(leagueShort)) return false;
-  const projectName = item.project ? item.project.name : null;
-  if (projectName && CONFIG.EXCLUDED_PROJECTS.some(p => projectName.includes(p))) return false;
   return true;
 }
 
@@ -1583,7 +1581,7 @@ function test_WriteBoardForDate() {
   const ui = SpreadsheetApp.getUi();
   const resp = ui.prompt(
     'Записать на доску',
-    'Какую дату спарсить? (например 26.09.2026 или 2026-09-26)',
+    'Какую дату спарсить? Прошедшая или будущая — без разницы. (например 26.09.2026 или 2026-09-26)',
     ui.ButtonSet.OK_CANCEL
   );
   if (resp.getSelectedButton() !== ui.Button.OK) return;
@@ -1595,12 +1593,13 @@ function test_WriteBoardForDate() {
     return;
   }
 
-  const items = fetchUpcomingAssignments_();
-  const dayItems = items.filter(it => it.event.date === DATE);
-  const entries = groupByEvent_(dayItems);
+  // Диапазон дат ровно на эту дату (не fetchUpcomingAssignments_ — та смотрит
+  // только вперёд от сегодня на LOOKAHEAD_DAYS, прошлые даты ей не достать).
+  const items = fetchAssignmentsForRange_(DATE, DATE);
+  const entries = groupByEvent_(items);
 
   if (entries.length === 0) {
-    ui.alert(`На ${DATE} мероприятий не найдено в горизонте LOOKAHEAD_DAYS (${CONFIG.LOOKAHEAD_DAYS} дней вперёд).`);
+    ui.alert(`На ${DATE} мероприятий не найдено в BMS.`);
     return;
   }
 
