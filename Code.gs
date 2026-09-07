@@ -856,13 +856,13 @@ function roleLabel_(line, item) {
 
 function executorName_(line) {
   const at = line.assignment_technical;
-  if (at && at.employee) return `${at.employee.last_name} ${at.employee.first_name}`.trim();
+  if (at && at.employee) return normalizeFio_(`${at.employee.last_name} ${at.employee.first_name}`);
   // Подрядчики (ИП/СЗ/АНО/ООО/ОГАУ), похоже, тоже приходят через assignment_technical.employee
   // (у некоторых last_name пустой, а всё название — в first_name, отсюда случайные
-  // ведущие/замыкающие пробелы) — .trim() выше это лечит.
+  // ведущие/замыкающие пробелы) — normalizeFio_ это лечит.
   // Ниже — запасной путь на случай, если для КАКИХ-ТО строк формат окажется другим.
   if (line.assignment_contractor && line.assignment_contractor.contractor) {
-    return String(line.assignment_contractor.contractor.name || '').trim();
+    return normalizeFio_(line.assignment_contractor.contractor.name);
   }
   return '';
 }
@@ -1404,6 +1404,12 @@ function notifyReplacementCandidates_(event, item, declinedLine) {
  */
 /** Обрезает "Фамилия Имя Отчество" до "Фамилия Имя" — так везде выглядят
  * исполнители на доске, отчество там не нужно. */
+/** Схлопывает лишние пробелы (двойные, ведущие, замыкающие) в ФИО — иначе
+ * "Фамилия  Имя   Отчество" из-за пробелов в отдельных полях BMS. */
+function normalizeFio_(fio) {
+  return String(fio || '').replace(/\s+/g, ' ').trim();
+}
+
 function shortName_(fullName) {
   const parts = String(fullName || '').trim().split(/\s+/);
   return parts.slice(0, 2).join(' ');
@@ -1475,7 +1481,24 @@ function detectDraftAssignment_(cellText, lineName) {
  */
 function scanDraftAssignments() {
   const ui = SpreadsheetApp.getUi();
-  const items = fetchUpcomingAssignments_();
+  const resp = ui.prompt(
+    'Перенести черновики в BMS',
+    'Дата для проверки (дд.мм.гггг или гггг-мм-дд) — прошедшая или будущая, ' +
+    'без разницы. Оставь пустым, чтобы проверить всё в горизонте вперёд:',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+
+  const rawDate = resp.getResponseText().trim();
+  let items;
+  if (rawDate) {
+    const DATE = parseDateInput_(rawDate);
+    if (!DATE) { ui.alert('Не понял дату: ' + rawDate); return; }
+    items = fetchAssignmentsForRange_(DATE, DATE);
+  } else {
+    items = fetchUpcomingAssignments_();
+  }
+
   const boardStateMap = getBoardStateMap_();
   const found = [];
   const ambiguous = [];
@@ -1795,7 +1818,7 @@ function fetchAndCacheStaffSchedule_(dateFrom, dateTo) {
       const emp = entry.employee;
       const { title, dept } = getEmployeeDeptInfo_(emp);
       const category = (emp.user_line_categories || []).find(c => c.line && c.line.id === line.id);
-      const fullName = `${emp.last_name} ${emp.first_name} ${emp.middle_name || ''}`.trim();
+      const fullName = normalizeFio_(`${emp.last_name} ${emp.first_name} ${emp.middle_name || ''}`);
       const phone = emp.phone_number || '';
       const daysByDate = {};
       (entry.days || []).forEach(d => { daysByDate[d.date] = d; });
