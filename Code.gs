@@ -76,17 +76,12 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('BMS')
     .addItem('🔑 Войти в BMS', 'menuLogin')
-    .addItem('▶ Запустить проверку новых мероприятий', 'doPoll')
-    .addItem('🧪 Тест: заполнить "Тех блок" по текущим данным', 'test_FillTechBlockForAllCurrentEvents')
-    .addItem('🧪 Тест: записать на доску (event 14175)', 'test_WriteBoardForEvent')
-    .addItem('▶ Записать на доску дату...', 'test_WriteBoardForDate')
-    .addItem('📅 Записать на доску месяц целиком...', 'writeBoardForMonth')
-    .addItem('📋 Обновить график персонала сейчас', 'refreshStaffScheduleNow')
-    .addItem('🔬 Дамп структуры выделенных ячеек (для отладки доски)', 'debugDumpSelection')
-    .addItem('🧹 Сбросить реестр положений на доске', 'resetBoardState')
+    .addItem('▶ Выгрузить на доску из BMS дату...', 'test_WriteBoardForDate')
+    .addItem('📅 Выгрузить на доску из BMS месяц...', 'writeBoardForMonth')
+    .addItem('📋 Обновить график персонала', 'refreshStaffScheduleNow')
     .addItem('🔍 Найти замену по ID мероприятия...', 'findReplacementsManually')
     .addItem('📝 Перенести черновики в BMS...', 'scanDraftAssignments')
-    .addItem('✏️ Добавить мероприятие на доску вручную', 'addManualEntry')
+    .addItem('🧹 Сбросить реестр положений на доске', 'resetBoardState')
     .addToUi();
 }
 
