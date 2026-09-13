@@ -1686,6 +1686,14 @@ function writeBoardForMonth() {
         for (const item of targetItems) {
           upsertMatchBlock_(event, item, boardStateMap);
           count++;
+          // Пауза каждые 10 блоков и принудительный сброс — за месяц набирается
+          // много отдельных обращений к Sheets (по ячейке за раз), и слишком
+          // частые подряд вызовы иногда роняют сам сервис с ошибкой
+          // "не может получить доступ к документу". Пауза снижает этот риск.
+          if (count % 10 === 0) {
+            SpreadsheetApp.flush();
+            Utilities.sleep(500);
+          }
         }
       }
       return count;
