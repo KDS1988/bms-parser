@@ -76,12 +76,17 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('BMS')
     .addItem('🔑 Войти в BMS', 'menuLogin')
-    .addItem('▶ Выгрузить на доску из BMS дату...', 'test_WriteBoardForDate')
-    .addItem('📅 Выгрузить на доску из BMS месяц...', 'writeBoardForMonth')
-    .addItem('📋 Обновить график персонала', 'refreshStaffScheduleNow')
+    .addItem('▶ Запустить проверку новых мероприятий', 'doPoll')
+    .addItem('🧪 Тест: заполнить "Тех блок" по текущим данным', 'test_FillTechBlockForAllCurrentEvents')
+    .addItem('🧪 Тест: записать на доску (event 14175)', 'test_WriteBoardForEvent')
+    .addItem('▶ Записать на доску дату...', 'test_WriteBoardForDate')
+    .addItem('📅 Записать на доску месяц целиком...', 'writeBoardForMonth')
+    .addItem('📋 Обновить график персонала сейчас', 'refreshStaffScheduleNow')
+    .addItem('🔬 Дамп структуры выделенных ячеек (для отладки доски)', 'debugDumpSelection')
+    .addItem('🧹 Сбросить реестр положений на доске', 'resetBoardState')
     .addItem('🔍 Найти замену по ID мероприятия...', 'findReplacementsManually')
     .addItem('📝 Перенести черновики в BMS...', 'scanDraftAssignments')
-    .addItem('🧹 Сбросить реестр положений на доске', 'resetBoardState')
+    .addItem('✏️ Добавить мероприятие на доску вручную', 'addManualEntry')
     .addToUi();
 }
 
@@ -1613,24 +1618,32 @@ function test_WriteBoardForDate() {
 
   // Диапазон дат ровно на эту дату (не fetchUpcomingAssignments_ — та смотрит
   // только вперёд от сегодня на LOOKAHEAD_DAYS, прошлые даты ей не достать).
-  const items = fetchAssignmentsForRange_(DATE, DATE);
-  const entries = groupByEvent_(items);
+  let written;
+  try {
+    written = withBoardLock_(() => {
+      const items = fetchAssignmentsForRange_(DATE, DATE);
+      const entries = groupByEvent_(items);
+      if (entries.length === 0) return 0;
 
-  if (entries.length === 0) {
-    ui.alert(`На ${DATE} мероприятий не найдено в BMS.`);
+      const boardStateMap = getBoardStateMap_();
+      let count = 0;
+      for (const { event, items: evItems } of entries) {
+        const targetItems = evItems.filter(isTargetItem_);
+        for (const item of targetItems) {
+          upsertMatchBlock_(event, item, boardStateMap);
+          count++;
+        }
+      }
+      return count;
+    });
+  } catch (e) {
+    ui.alert(String(e));
     return;
   }
 
-  const boardStateMap = getBoardStateMap_();
-  let written = 0;
-  for (const { event, items: evItems } of entries) {
-    const targetItems = evItems.filter(isTargetItem_);
-    for (const item of targetItems) {
-      upsertMatchBlock_(event, item, boardStateMap);
-      written++;
-    }
-  }
-  ui.alert(`Готово. Записано/обновлено блоков: ${written}`);
+  ui.alert(written === 0
+    ? `На ${DATE} мероприятий не найдено в BMS.`
+    : `Готово. Записано/обновлено блоков: ${written}`);
 }
 
 /**
@@ -1659,24 +1672,32 @@ function writeBoardForMonth() {
   const lastDay = daysInMonth_(year, month0);
   const dateTo = Utilities.formatDate(new Date(year, month0, lastDay), 'Europe/Moscow', 'yyyy-MM-dd');
 
-  const items = fetchAssignmentsForRange_(dateFrom, dateTo);
-  const entries = groupByEvent_(items);
+  let written;
+  try {
+    written = withBoardLock_(() => {
+      const items = fetchAssignmentsForRange_(dateFrom, dateTo);
+      const entries = groupByEvent_(items);
+      if (entries.length === 0) return 0;
 
-  if (entries.length === 0) {
-    ui.alert(`За ${dateFrom} — ${dateTo} мероприятий не найдено в BMS.`);
+      const boardStateMap = getBoardStateMap_();
+      let count = 0;
+      for (const { event, items: evItems } of entries) {
+        const targetItems = evItems.filter(isTargetItem_);
+        for (const item of targetItems) {
+          upsertMatchBlock_(event, item, boardStateMap);
+          count++;
+        }
+      }
+      return count;
+    });
+  } catch (e) {
+    ui.alert(String(e));
     return;
   }
 
-  const boardStateMap = getBoardStateMap_();
-  let written = 0;
-  for (const { event, items: evItems } of entries) {
-    const targetItems = evItems.filter(isTargetItem_);
-    for (const item of targetItems) {
-      upsertMatchBlock_(event, item, boardStateMap);
-      written++;
-    }
-  }
-  ui.alert(`Готово. Записано/обновлено блоков: ${written} за ${dateFrom} — ${dateTo}.`);
+  ui.alert(written === 0
+    ? `За ${dateFrom} — ${dateTo} мероприятий не найдено в BMS.`
+    : `Готово. Записано/обновлено блоков: ${written} за ${dateFrom} — ${dateTo}.`);
 }
 
 /** Принимает "07.2026" или "2026-07", возвращает {year, month0} (month0 — с 0) или null. */
@@ -2025,19 +2046,27 @@ function processEventEntry_(event, items, seenEvents, boardStateMap) {
 }
 
 function doPoll() {
-  const seenEvents = getSeenEventIds_();
-  const boardStateMap = getBoardStateMap_();
-
-  let entries;
   try {
-    entries = groupByEvent_(fetchUpcomingAssignments_());
-  } catch (e) {
-    notifyAuthFailure_(e);
-    return;
-  }
+    withBoardLock_(() => {
+      const seenEvents = getSeenEventIds_();
+      const boardStateMap = getBoardStateMap_();
 
-  for (const { event, items } of entries) {
-    processEventEntry_(event, items, seenEvents, boardStateMap);
+      let entries;
+      try {
+        entries = groupByEvent_(fetchUpcomingAssignments_());
+      } catch (e) {
+        notifyAuthFailure_(e);
+        return;
+      }
+
+      for (const { event, items } of entries) {
+        processEventEntry_(event, items, seenEvents, boardStateMap);
+      }
+    });
+  } catch (e) {
+    // Не получилось взять блокировку (кто-то ещё сейчас пишет на доску) —
+    // просто пропускаем этот прогон, следующий по расписанию подхватит сам.
+    Logger.log(`doPoll: ${e}`);
   }
 }
 
@@ -2052,6 +2081,29 @@ function doPoll() {
  * access: Anyone. Полученный URL — это и есть APPS_SCRIPT_WEBHOOK_URL для
  * GitHub Actions.
  */
+/**
+ * Общая блокировка для любой ручной записи на доску (месяц/дата/т.п.) —
+ * защищает от той же беды, что и в doPost: если одновременно с долгой ручной
+ * записью сработает автоматический опрос от GitHub Actions, оба полезут
+ * писать в таблицу одновременно, и Google Sheets начинает отказывать с
+ * "Сервис Таблицы слишком долго не может получить доступ к документу".
+ * Таймаут ожидания больше, чем в doPost (там 30 сек) — ручная запись месяца
+ * может занять реально много времени, конкурирующему опросу проще подождать.
+ */
+function withBoardLock_(fn) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(120000);
+  } catch (e) {
+    throw new Error('Не удалось получить доступ к таблице — сейчас идёт другая запись на доску (например, автоопрос от GitHub). Попробуй через минуту-две.');
+  }
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function doPost(e) {
   // Блокировка: если два запроса (например, ручной запуск GitHub Actions
   // наложился на плановый по крону) прилетят почти одновременно, второй
