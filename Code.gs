@@ -936,7 +936,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
   if (kind === 'contractor') {
     // Блок подрядчика формируется только когда исполнитель у ВСЕХ строк один и
     // тот же реальный (не пустой) — черновиков тут по определению не бывает,
-    // можно чистить и писать смело.
+    // можно чистить и писать смело. Всего 6 ячеек — пакетность тут не критична.
     sheet.getRange(startRow, col, 2, BOARD_GROUP_WIDTH).clearContent().clearFormat();
     sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
     setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, isCancelled, item.id);
@@ -947,13 +947,26 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
     return;
   }
 
-  const neededRows = 1 + roleLines.length + cameraLines.length;
+  // Роли и операторы вместе, по порядку — единый список, чтобы собрать все
+  // значения/цвета/жирность в массивы и записать их ПАКЕТНО (несколько
+  // вызовов на весь блок, а не по 3-4 вызова на каждую отдельную строку —
+  // на блоке с десятком строк разница на порядок, а за целый месяц с
+  // сотней мероприятий именно это раньше роняло сам сервис Google Таблиц).
+  const allLines = roleLines.map(l => ({ line: l, isCamera: false }))
+    .concat(cameraLines.map(l => ({ line: l, isCamera: true })));
+  const neededRows = 1 + allLines.length;
   ensureRoomForBlock_(sheet, day, headerRow, neededRows, boardStateMap);
 
   // после возможной вставки строк узнаём актуальную границу дня для очистки старого содержимого
   const map = loadDayRowMap_(sheet.getName()) || {};
   const nextHeaderRow = map[day + 1];
   const clearRows = nextHeaderRow ? (nextHeaderRow - startRow) : Math.max(neededRows, DEFAULT_DAY_ROWS - 1);
+
+  // Читаем текущие значения исполнителя ДО очистки формата — нужно, чтобы не
+  // потерять вручную вписанные черновики (сохраняем их как есть при записи).
+  const prevExecValues = allLines.length > 0
+    ? sheet.getRange(startRow + 1, col + 1, allLines.length, 1).getValues()
+    : [];
 
   // Колонки "роль" (label) и "N кам" — целиком выводятся из BMS, чистим смело.
   sheet.getRange(startRow, col, clearRows, 1).clearContent().clearFormat();
@@ -966,35 +979,54 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
   setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, isCancelled, item.id); // шапка — не черновая зона, пишем всегда
   sheet.getRange(startRow, col + 2).setValue(`${cameraLines.length} кам`);
 
-  let row = startRow + 1;
-  for (const line of roleLines) {
-    sheet.getRange(row, col).setValue(roleLabel_(line, item));
-    const cell = sheet.getRange(row, col + 1).setBackground(BOARD_PINK);
+  if (allLines.length === 0) {
+    styleMatchBlock_(sheet, startRow, startRow, col);
+    return;
+  }
+
+  const labelValues = [];
+  const execValues = [];
+  const execBg = [];
+  const execWeights = [];
+  const execColors = [];
+
+  allLines.forEach((entry, i) => {
+    const line = entry.line;
+    labelValues.push([entry.isCamera ? '' : roleLabel_(line, item)]);
+
     const executor = executorName_(line);
+    let value, bold = 'normal', color = '#000000';
+
     if (executor) {
-      cell.setValue(executor);
-      applyStatusStyle_(cell, executorStatus_(line));
+      value = executor;
+      const status = executorStatus_(line);
+      if (status === 'declined') color = '#cc0000';
+      else if (status === 'appointed') bold = 'bold';
     } else if (oldExecutorById && oldExecutorById[line.id]) {
       // раньше тут реально кто-то был назначен в BMS, теперь снят — это не
       // черновик, а настоящее снятие с назначения, чистим
-      cell.setValue('');
+      value = '';
+    } else {
+      // роль как была не назначена, так и осталась: не трогаем — вдруг там
+      // вписанная вручную черновая фамилия (сохраняем прежнее значение ячейки)
+      value = prevExecValues[i][0];
     }
-    // иначе — роль как была не назначена, так и осталась: не трогаем ячейку,
-    // вдруг там вписанная вручную черновая фамилия
-    row++;
-  }
-  for (const line of cameraLines) {
-    const cell = sheet.getRange(row, col + 1).setBackground(BOARD_BLUE);
-    const executor = executorName_(line);
-    if (executor) {
-      cell.setValue(executor);
-      applyStatusStyle_(cell, executorStatus_(line));
-    } else if (oldExecutorById && oldExecutorById[line.id]) {
-      cell.setValue('');
-    }
-    row++;
-  }
-  styleMatchBlock_(sheet, startRow, row - 1, col);
+
+    execValues.push([value]);
+    execBg.push([entry.isCamera ? BOARD_BLUE : BOARD_PINK]);
+    execWeights.push([bold]);
+    execColors.push([color]);
+  });
+
+  sheet.getRange(startRow + 1, col, allLines.length, 1).setValues(labelValues);
+
+  const execRange = sheet.getRange(startRow + 1, col + 1, allLines.length, 1);
+  execRange.setValues(execValues);
+  execRange.setBackgrounds(execBg);
+  execRange.setFontWeights(execWeights);
+  execRange.setFontColors(execColors);
+
+  styleMatchBlock_(sheet, startRow, startRow + allLines.length, col);
 }
 
 const BOARD_NAME_COL_WIDTH_PX = 189; // ~5 см при 96 DPI — фиксированная, без авторасчёта
