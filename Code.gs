@@ -85,6 +85,7 @@ function onOpen() {
     .addItem('🔬 Дамп структуры выделенных ячеек (для отладки доски)', 'debugDumpSelection')
     .addItem('🧹 Сбросить реестр положений на доске', 'resetBoardState')
     .addItem('🔍 Найти замену по ID мероприятия...', 'findReplacementsManually')
+    .addItem('🗑 Проверить удалённые мероприятия...', 'checkDeletedEvents')
     .addItem('📝 Перенести черновики в BMS...', 'scanDraftAssignments')
     .addItem('✏️ Добавить мероприятие на доску вручную', 'addManualEntry')
     .addToUi();
@@ -803,15 +804,18 @@ function reserveContractorSlot_(sheet, day, headerRow) {
  * наведению) — по ней код узнаёт блок, даже если его перенесли вручную в
  * пределах дня (Sheets переносит заметку вместе с содержимым при вырезании/
  * вставке или перетаскивании диапазона).
+ *
+ * statusSuffix — необязательная метка после ID, красным жирным (например
+ * "ОТМЕНА" или "УДАЛЕНО"), null/пусто — без метки.
  */
-function setHeaderTeamCell_(cell, homeTeam, eventId, isCancelled, itemId) {
+function setHeaderTeamCell_(cell, homeTeam, eventId, statusSuffix, itemId) {
   const base = `${homeTeam} (ID ${eventId})`;
   cell.setNote(String(itemId));
-  if (!isCancelled) {
+  if (!statusSuffix) {
     cell.setValue(base).setFontWeight('bold').setFontColor(null);
     return;
   }
-  const suffix = ' ОТМЕНА';
+  const suffix = ' ' + statusSuffix;
   const full = base + suffix;
   const rich = SpreadsheetApp.newRichTextValue()
     .setText(full)
@@ -931,7 +935,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
   const league = event.league ? event.league.short_name : '';
   const homeTeam = eventDisplayName_(event);
   const { roleLines, cameraLines, uniqueExecutors } = classifyLines_(item);
-  const isCancelled = !!(item.service_status && item.service_status.indexOf('Отмен') === 0);
+  const cancelSuffix = (item.service_status && item.service_status.indexOf('Отмен') === 0) ? 'ОТМЕНА' : null;
 
   if (kind === 'contractor') {
     // Блок подрядчика формируется только когда исполнитель у ВСЕХ строк один и
@@ -939,7 +943,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
     // можно чистить и писать смело. Всего 6 ячеек — пакетность тут не критична.
     sheet.getRange(startRow, col, 2, BOARD_GROUP_WIDTH).clearContent().clearFormat();
     sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
-    setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, isCancelled, item.id);
+    setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, cancelSuffix, item.id);
     sheet.getRange(startRow, col + 2).setValue(`${cameraLines.length} кам`);
     const contractorCell = sheet.getRange(startRow + 1, col + 1).setValue(uniqueExecutors[0]).setBackground(BOARD_PINK);
     applyStatusStyle_(contractorCell, aggregateStatus_(roleLines.concat(cameraLines)));
@@ -976,7 +980,7 @@ function renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, it
   sheet.getRange(startRow, col + 1, clearRows, 1).clearFormat();
 
   sheet.getRange(startRow, col).setValue(league).setFontWeight('bold');
-  setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, isCancelled, item.id); // шапка — не черновая зона, пишем всегда
+  setHeaderTeamCell_(sheet.getRange(startRow, col + 1), homeTeam, event.id, cancelSuffix, item.id); // шапка — не черновая зона, пишем всегда
   sheet.getRange(startRow, col + 2).setValue(`${cameraLines.length} кам`);
 
   if (allLines.length === 0) {
@@ -1132,6 +1136,96 @@ function resetBoardState() {
  * (независимо от того, впервые это или нет) показывает подбор замен — минуя
  * логику "уведомляем только на переходе", удобно для проверки/повторного запроса.
  */
+// ============================== УДАЛЁННЫЕ МЕРОПРИЯТИЯ ==============================
+
+/**
+ * Помечает блок как удалённый из BMS — красным "УДАЛЕНО" после ID в заголовке,
+ * не трогая остальное содержимое блока (видно, кто был назначен до удаления).
+ * Не переносит блок и не пересчитывает его положение — просто перекрашивает
+ * ту же заголовочную ячейку. Не шлёт повторное уведомление, если уже помечено.
+ */
+function markEventDeleted_(boardState, eventServiceId) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(boardState.sheetName);
+  if (!sheet) return;
+
+  const cell = sheet.getRange(boardState.startRow, boardState.col + 1);
+  const currentText = String(cell.getValue());
+  if (currentText.includes('УДАЛЕНО')) return; // уже помечено
+
+  // Само мероприятие в BMS больше не существует — берём название из того,
+  // что уже написано на доске (обрезаем " (ID ...)" в конце).
+  const homeTeamGuess = currentText.replace(/\s*\(ID \d+\).*$/, '');
+  setHeaderTeamCell_(cell, homeTeamGuess, boardState.eventId, 'УДАЛЕНО', eventServiceId);
+
+  sendTelegramMessage_(
+    `🗑 <b>Мероприятие удалено из BMS</b>\n${boardState.date || ''} ${homeTeamGuess}`.trim()
+  );
+}
+
+/**
+ * Сверяет всё, что отмечено на доске за указанный период, с тем, что BMS
+ * реально сейчас возвращает — если какая-то услуга пропала из ответа API
+ * (менеджер удалил мероприятие целиком, не просто отменил услугу — это
+ * отдельно уже покрыто пометкой "ОТМЕНА" по service_status) — помечает
+ * "УДАЛЕНО" и уведомляет в Telegram.
+ */
+function checkForDeletedEvents_(dateFrom, dateTo) {
+  const items = fetchAssignmentsForRange_(dateFrom, dateTo);
+  const seenIds = new Set(items.map(it => String(it.id)));
+
+  const boardStateMap = getBoardStateMap_();
+  let markedCount = 0;
+
+  Object.keys(boardStateMap).forEach(key => {
+    const st = boardStateMap[key];
+    if (!st.date || st.date < dateFrom || st.date > dateTo) return; // вне проверяемого периода
+    if (seenIds.has(key)) return; // всё ещё существует в BMS
+
+    markEventDeleted_(st, key);
+    markedCount++;
+  });
+
+  return markedCount;
+}
+
+/** Ручная проверка через меню — период вводится в диалоге, пусто = ближайшие LOOKAHEAD_DAYS дней. */
+function checkDeletedEvents() {
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.prompt(
+    'Проверить удалённые мероприятия',
+    'За какой период сверить с BMS? Даты через тире (14.08.2026 - 20.08.2026), ' +
+    'либо оставь пустым — тогда ближайшие ' + CONFIG.LOOKAHEAD_DAYS + ' дней вперёд:',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+
+  let dateFrom, dateTo;
+  const raw = resp.getResponseText().trim();
+  if (raw) {
+    const parts = raw.split(/\s*-\s*/).filter(Boolean);
+    if (parts.length !== 2) { ui.alert('Нужно две даты через тире, например: 14.08.2026 - 20.08.2026'); return; }
+    dateFrom = parseDateInput_(parts[0]);
+    dateTo = parseDateInput_(parts[1]);
+    if (!dateFrom || !dateTo) { ui.alert('Не понял даты: ' + raw); return; }
+  } else {
+    const today = new Date();
+    dateFrom = Utilities.formatDate(today, 'Europe/Moscow', 'yyyy-MM-dd');
+    const until = new Date(today.getTime() + CONFIG.LOOKAHEAD_DAYS * 86400000);
+    dateTo = Utilities.formatDate(until, 'Europe/Moscow', 'yyyy-MM-dd');
+  }
+
+  let marked;
+  try {
+    marked = withBoardLock_(() => checkForDeletedEvents_(dateFrom, dateTo));
+  } catch (e) {
+    ui.alert(String(e));
+    return;
+  }
+
+  ui.alert(`Готово. Помечено удалённых: ${marked} за ${dateFrom} — ${dateTo}.`);
+}
+
 function findReplacementsManually() {
   const ui = SpreadsheetApp.getUi();
   const resp = ui.prompt('Найти замену', 'ID мероприятия (event_id из BMS):', ui.ButtonSet.OK_CANCEL);
@@ -1241,40 +1335,41 @@ function getBoardStateSheet_() {
   if (!sheet) {
     sheet = ss.insertSheet(CONFIG.BOARD_STATE_SHEET_NAME);
     sheet.hideSheet();
-    sheet.appendRow(['event_service_id', 'event_id', 'sheet_name', 'header_row', 'col', 'start_row', 'kind', 'signature_json', 'updated_at']);
+    sheet.appendRow(['event_service_id', 'event_id', 'sheet_name', 'header_row', 'col', 'start_row', 'kind', 'signature_json', 'updated_at', 'date']);
   }
   return sheet;
 }
 
-/** Загружает весь реестр в память: event_service_id -> {row, sheetName, headerRow, col, startRow, kind, signature}. */
+/** Загружает весь реестр в память: event_service_id -> {row, sheetName, headerRow, col, startRow, kind, signature, date}. */
 function getBoardStateMap_() {
   const sheet = getBoardStateSheet_();
   const lastRow = sheet.getLastRow();
   const map = {};
   if (lastRow < 2) return map;
-  const values = sheet.getRange(2, 1, lastRow - 1, 9).getValues();
+  const values = sheet.getRange(2, 1, lastRow - 1, 10).getValues();
   values.forEach((r, i) => {
     map[String(r[0])] = {
       row: i + 2, eventId: r[1], sheetName: r[2],
       headerRow: r[3], col: r[4], startRow: r[5], kind: r[6], signature: r[7],
+      date: r[9],
     };
   });
   return map;
 }
 
-function upsertBoardState_(map, eventServiceId, eventId, sheetName, headerRow, col, startRow, kind, signatureJson) {
+function upsertBoardState_(map, eventServiceId, eventId, sheetName, headerRow, col, startRow, kind, signatureJson, date) {
   const sheet = getBoardStateSheet_();
   const key = String(eventServiceId);
   const existing = map[key];
-  const rowData = [eventServiceId, eventId, sheetName, headerRow, col, startRow, kind, signatureJson, new Date()];
+  const rowData = [eventServiceId, eventId, sheetName, headerRow, col, startRow, kind, signatureJson, new Date(), date];
   if (existing) {
-    sheet.getRange(existing.row, 1, 1, 9).setValues([rowData]);
+    sheet.getRange(existing.row, 1, 1, 10).setValues([rowData]);
   } else {
     sheet.appendRow(rowData);
   }
   map[key] = {
     row: existing ? existing.row : sheet.getLastRow(),
-    eventId, sheetName, headerRow, col, startRow, kind, signature: signatureJson,
+    eventId, sheetName, headerRow, col, startRow, kind, signature: signatureJson, date,
   };
 }
 
@@ -1351,7 +1446,7 @@ function upsertMatchBlock_(event, item, boardStateMap) {
   renderMatchBlock_(sheet, day, headerRow, col, startRow, kind, event, item, boardStateMap, oldExecutorById);
 
   const newSig = lineSignature_(item);
-  upsertBoardState_(boardStateMap, item.id, event.id, sheet.getName(), headerRow, col, startRow, kind, JSON.stringify(newSig));
+  upsertBoardState_(boardStateMap, item.id, event.id, sheet.getName(), headerRow, col, startRow, kind, JSON.stringify(newSig), event.date);
 
   return {
     isNew: !existing,
@@ -1989,6 +2084,20 @@ function dailyStaffScheduleFetch() {
 
   fetchAndCacheStaffSchedule_(dateFrom, dateTo);
   renderStaffScheduleView_();
+
+  // Заодно раз в сутки сверяем доску с BMS на предмет удалённых мероприятий —
+  // отдельно от основного опроса (doPoll/doPost), т.к. GitHub шлёт события
+  // небольшими пачками и не видит полной картины разом, только Apps Script
+  // может сверить "всё, что должно быть" за весь горизонт целиком.
+  try {
+    withBoardLock_(() => {
+      const untilLookahead = new Date(today.getTime() + CONFIG.LOOKAHEAD_DAYS * 86400000);
+      const lookaheadTo = Utilities.formatDate(untilLookahead, 'Europe/Moscow', 'yyyy-MM-dd');
+      checkForDeletedEvents_(dateFrom, lookaheadTo);
+    });
+  } catch (e) {
+    Logger.log(`dailyStaffScheduleFetch: проверка удалённых мероприятий не удалась: ${e}`);
+  }
 }
 
 /** Ручной пункт меню: немедленно обновить кэш (на скользящий месяц вперёд) и перерисовать лист. */
