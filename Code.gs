@@ -15,6 +15,15 @@
  * 4. Поставить триггер: doPoll, time-driven, every 5-10 minutes.
  */
 
+// Версия кода — бампится при каждом присланном обновлении. Меню "ℹ️ Версия
+// кода" (ниже) сразу показывает, какая версия реально работает в Apps
+// Script — так не нужно гадать, долетело ли последнее обновление целиком.
+const CODE_VERSION = '2026-10-01-1';
+
+function showCodeVersion() {
+  SpreadsheetApp.getUi().alert(`Версия кода: ${CODE_VERSION}`);
+}
+
 const CONFIG = {
   BMS_API: 'https://bms-api.vsporte.ru/api/v1/bms',
 
@@ -84,6 +93,8 @@ function onOpen() {
     .addItem('📋 Обновить график персонала сейчас', 'refreshStaffScheduleNow')
     .addItem('🔬 Дамп структуры выделенных ячеек (для отладки доски)', 'debugDumpSelection')
     .addItem('🧹 Сбросить реестр положений на доске', 'resetBoardState')
+    .addSeparator()
+    .addItem('ℹ️ Версия кода', 'showCodeVersion')
     .addItem('🔍 Найти замену по ID мероприятия...', 'findReplacementsManually')
     .addItem('🗑 Проверить удалённые мероприятия...', 'checkDeletedEvents')
     .addItem('📝 Перенести черновики в BMS...', 'scanDraftAssignments')
@@ -726,7 +737,7 @@ function bumpBoardStateHeaderRows_(sheetName, afterHeaderRow, delta, boardStateM
  * соревнования без структурированной лиги) ячейка с лигой законно пустая.
  */
 function findFreeColumnGroup_(sheet, row, day) {
-  const reserved = day != null ? getAllStackReservedCols_(sheet.getName(), day) : new Set();
+  const reserved = day != null ? getAllStackReservedCols_(sheet, row, day) : new Set();
 
   let col = 2; // B
   while (sheet.getRange(row, col + 1).getValue() !== '' || reserved.has(col)) {
@@ -735,16 +746,42 @@ function findFreeColumnGroup_(sheet, row, day) {
   return col;
 }
 
-/** Все колонки, занятые ЛЮБЫМИ столбиками (по любому groupKey) для этого дня. */
-function getAllStackReservedCols_(sheetName, day) {
-  const prefix = `STACK::${sheetName}::day${day}::`;
-  const props = PropertiesService.getScriptProperties().getProperties();
+/**
+ * Все колонки, занятые ЛЮБЫМИ столбиками (по любому groupKey) для этого дня —
+ * но не вслепую: для каждой найденной резервации проверяет, есть ли реально
+ * хоть что-то в заявленной высоте столбика на самом листе. Если резервация
+ * "осиротела" (например, после смены схемы реестра в прошлом, или блок
+ * удалили руками) — не учитывает её как занятую И сразу удаляет сам ключ из
+ * Script Properties, чтобы мусор не накапливался и не расталкивал новые
+ * блоки по случайным дальним колонкам.
+ */
+function getAllStackReservedCols_(sheet, row, day) {
+  const prefix = `STACK::${sheet.getName()}::day${day}::`;
+  const props = PropertiesService.getScriptProperties();
+  const allProps = props.getProperties();
   const cols = new Set();
-  Object.keys(props).forEach(key => {
-    if (key.startsWith(prefix)) {
-      try { cols.add(JSON.parse(props[key]).col); } catch (e) { /* мусор в properties — игнорируем */ }
+
+  Object.keys(allProps).forEach(key => {
+    if (!key.startsWith(prefix)) return;
+    let stack;
+    try {
+      stack = JSON.parse(allProps[key]);
+    } catch (e) {
+      props.deleteProperty(key); // не JSON — точно мусор
+      return;
+    }
+
+    const rowsToCheck = stack.nextRow - row;
+    const hasContent = rowsToCheck > 0 &&
+      sheet.getRange(row, stack.col + 1, rowsToCheck, 1).getValues().some(r => r[0] !== '');
+
+    if (hasContent) {
+      cols.add(stack.col);
+    } else {
+      props.deleteProperty(key); // осиротевшая резервация — подчищаем сами, без ручного сброса
     }
   });
+
   return cols;
 }
 
