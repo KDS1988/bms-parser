@@ -18,7 +18,7 @@
 // Версия кода — бампится при каждом присланном обновлении. Меню "ℹ️ Версия
 // кода" (ниже) сразу показывает, какая версия реально работает в Apps
 // Script — так не нужно гадать, долетело ли последнее обновление целиком.
-const CODE_VERSION = '2026-10-01-1';
+const CODE_VERSION = '2026-10-01-2';
 
 function showCodeVersion() {
   SpreadsheetApp.getUi().alert(`Версия кода: ${CODE_VERSION}`);
@@ -97,6 +97,7 @@ function onOpen() {
     .addItem('ℹ️ Версия кода', 'showCodeVersion')
     .addItem('🔍 Найти замену по ID мероприятия...', 'findReplacementsManually')
     .addItem('🗑 Проверить удалённые мероприятия...', 'checkDeletedEvents')
+    .addItem('♻️ Исправить ложные пометки "УДАЛЕНО"...', 'fixFalseDeletions')
     .addItem('📝 Перенести черновики в BMS...', 'scanDraftAssignments')
     .addItem('✏️ Добавить мероприятие на доску вручную', 'addManualEntry')
     .addToUi();
@@ -1207,19 +1208,47 @@ function markEventDeleted_(boardState, eventServiceId) {
  * отдельно уже покрыто пометкой "ОТМЕНА" по service_status) — помечает
  * "УДАЛЕНО" и уведомляет в Telegram.
  */
+/**
+ * Сверяет всё, что отмечено на доске за указанный период, с тем, что BMS
+ * реально сейчас возвращает — если какая-то услуга пропала из ответа API
+ * (менеджер удалил мероприятие целиком, не просто отменил услугу — это
+ * отдельно уже покрыто пометкой "ОТМЕНА" по service_status) — помечает
+ * "УДАЛЕНО" и уведомляет в Telegram.
+ *
+ * Помечает НЕ сразу — только если мероприятие отсутствует ДВА раза подряд
+ * (на двух отдельных запусках этой функции). Один прогон, где BMS вернула
+ * неполные данные (сетевой сбой, недогруженная страница и т.п.), раньше сразу
+ * ложно помечал реальные мероприятия "УДАЛЕНО" навсегда — обычный опрос
+ * никогда больше не трогает то, что перестало меняться (прошедшие,
+ * полностью укомплектованные), так что исправить это было некому.
+ */
 function checkForDeletedEvents_(dateFrom, dateTo) {
   const items = fetchAssignmentsForRange_(dateFrom, dateTo);
   const seenIds = new Set(items.map(it => String(it.id)));
 
   const boardStateMap = getBoardStateMap_();
+  const props = PropertiesService.getScriptProperties();
   let markedCount = 0;
 
   Object.keys(boardStateMap).forEach(key => {
     const st = boardStateMap[key];
     if (!st.date || st.date < dateFrom || st.date > dateTo) return; // вне проверяемого периода
-    if (seenIds.has(key)) return; // всё ещё существует в BMS
 
+    const pendingKey = `PENDING_DELETE::${key}`;
+    if (seenIds.has(key)) {
+      props.deleteProperty(pendingKey); // снова видим в BMS — снимаем подозрение
+      return;
+    }
+
+    if (!props.getProperty(pendingKey)) {
+      // отсутствует впервые — не помечаем сразу, запоминаем и ждём повторной проверки
+      props.setProperty(pendingKey, new Date().toISOString());
+      return;
+    }
+
+    // отсутствует уже на второй проверке подряд — теперь помечаем по-настоящему
     markEventDeleted_(st, key);
+    props.deleteProperty(pendingKey);
     markedCount++;
   });
 
@@ -1261,6 +1290,63 @@ function checkDeletedEvents() {
   }
 
   ui.alert(`Готово. Помечено удалённых: ${marked} за ${dateFrom} — ${dateTo}.`);
+}
+
+/**
+ * Исправляет уже случившиеся ложные пометки "УДАЛЕНО": заново запрашивает
+ * BMS за указанный период, и для каждого блока, который сейчас показан как
+ * удалённый, но на самом деле НАШЁЛСЯ в свежих данных — перерисовывает его
+ * заново нормально (снимает ложную пометку и восстанавливает актуальный
+ * состав ролей/исполнителей).
+ */
+function fixFalseDeletions() {
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.prompt(
+    'Исправить ложные пометки "УДАЛЕНО"',
+    'За какой период перепроверить с BMS и восстановить? Даты через тире (14.08.2026 - 20.08.2026):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+
+  const raw = resp.getResponseText().trim();
+  const parts = raw.split(/\s*-\s*/).filter(Boolean);
+  if (parts.length !== 2) { ui.alert('Нужно две даты через тире, например: 14.08.2026 - 20.08.2026'); return; }
+  const dateFrom = parseDateInput_(parts[0]);
+  const dateTo = parseDateInput_(parts[1]);
+  if (!dateFrom || !dateTo) { ui.alert('Не понял даты: ' + raw); return; }
+
+  let fixed;
+  try {
+    fixed = withBoardLock_(() => {
+      const items = fetchAssignmentsForRange_(dateFrom, dateTo);
+      const entries = groupByEvent_(items);
+      const boardStateMap = getBoardStateMap_();
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      let count = 0;
+
+      for (const { event, items: evItems } of entries) {
+        const targetItems = evItems.filter(isTargetItem_);
+        for (const item of targetItems) {
+          const st = boardStateMap[String(item.id)];
+          if (!st) continue; // никогда не был на доске — не наш случай
+
+          const sheet = ss.getSheetByName(st.sheetName);
+          if (!sheet) continue;
+          const cellText = String(sheet.getRange(st.startRow, st.col + 1).getValue());
+          if (!cellText.includes('УДАЛЕНО')) continue; // не был ложно помечен — не трогаем
+
+          upsertMatchBlock_(event, item, boardStateMap); // перерисует заново, уже правильно
+          count++;
+        }
+      }
+      return count;
+    });
+  } catch (e) {
+    ui.alert(String(e));
+    return;
+  }
+
+  ui.alert(`Готово. Восстановлено ошибочно помеченных блоков: ${fixed} за ${dateFrom} — ${dateTo}.`);
 }
 
 function findReplacementsManually() {
@@ -2122,19 +2208,11 @@ function dailyStaffScheduleFetch() {
   fetchAndCacheStaffSchedule_(dateFrom, dateTo);
   renderStaffScheduleView_();
 
-  // Заодно раз в сутки сверяем доску с BMS на предмет удалённых мероприятий —
-  // отдельно от основного опроса (doPoll/doPost), т.к. GitHub шлёт события
-  // небольшими пачками и не видит полной картины разом, только Apps Script
-  // может сверить "всё, что должно быть" за весь горизонт целиком.
-  try {
-    withBoardLock_(() => {
-      const untilLookahead = new Date(today.getTime() + CONFIG.LOOKAHEAD_DAYS * 86400000);
-      const lookaheadTo = Utilities.formatDate(untilLookahead, 'Europe/Moscow', 'yyyy-MM-dd');
-      checkForDeletedEvents_(dateFrom, lookaheadTo);
-    });
-  } catch (e) {
-    Logger.log(`dailyStaffScheduleFetch: проверка удалённых мероприятий не удалась: ${e}`);
-  }
+  // Проверку удалённых мероприятий убрал отсюда — она однажды сработала на
+  // одиночную неполную выдачу BMS и ложно пометила кучу реальных мероприятий
+  // "УДАЛЕНО" навсегда (обычный опрос их больше не трогает, раз в них ничего
+  // не меняется). Теперь только вручную, через меню, с защитой "два раза
+  // подряд" — см. checkForDeletedEvents_.
 }
 
 /** Ручной пункт меню: немедленно обновить кэш (на скользящий месяц вперёд) и перерисовать лист. */
