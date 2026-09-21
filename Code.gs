@@ -18,7 +18,7 @@
 // Версия кода — бампится при каждом присланном обновлении. Меню "ℹ️ Версия
 // кода" (ниже) сразу показывает, какая версия реально работает в Apps
 // Script — так не нужно гадать, долетело ли последнее обновление целиком.
-const CODE_VERSION = '2026-10-01-2';
+const CODE_VERSION = '2026-10-01-3';
 
 function showCodeVersion() {
   SpreadsheetApp.getUi().alert(`Версия кода: ${CODE_VERSION}`);
@@ -280,7 +280,7 @@ function bmsPost_(path, body) {
  * нужен id конкретной строки-назначения внутри этой услуги).
  */
 function assignEmployeeInBms_(eventServiceId, eventServiceLineId, employeeId) {
-  return bmsPost_('projects/assignment/technical', {
+  const assignment = bmsPost_('projects/assignment/technical', {
     comment: '',
     dismantling: false,
     employee_id: employeeId,
@@ -291,6 +291,38 @@ function assignEmployeeInBms_(eventServiceId, eventServiceLineId, employeeId) {
     logistics: null,
     event_service_video_task_list: [],
   });
+
+  // Само назначение не проставляет ставку — это отдельная запись "расхода"
+  // на другом эндпоинте, со своим отдельным запросом (так делает и сама BMS,
+  // когда менеджер жмёт "Отправить назначение" не трогая поле "Ставка").
+  // assignment_technical_id — это id, который вернул запрос выше.
+  // line_manual_rate: null значит "посчитать автоматически по таблице ставок
+  // сотрудника" — как и происходит по умолчанию в самой BMS.
+  try {
+    bmsPost_('accounting/expense/assignment/technical', {
+      event_service_id: eventServiceId,
+      event_service_line_id: eventServiceLineId,
+      assignment_technical_id: assignment.id,
+      assignment_creative_id: null,
+      assignment_video_id: null,
+      assignment_data_sport_id: null,
+      employee_id: employeeId,
+      line_manual_rate: null,
+      logistics: null,
+      bonus: null,
+      bonus_comment: null,
+      penalty: null,
+      penalty_comment: null,
+      comment: '',
+      event_service_video_task_list: [],
+    });
+  } catch (e) {
+    // Назначение уже создано (это главное) — ставку в крайнем случае можно
+    // проставить и вручную в BMS, если именно этот шаг не удался.
+    Logger.log(`assignEmployeeInBms_: назначение создано (id=${assignment.id}), но не удалось проставить ставку: ${e}`);
+  }
+
+  return assignment;
 }
 
 /** Собирает все мероприятия за произвольный диапазон дат (все страницы). */
