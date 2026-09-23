@@ -18,7 +18,7 @@
 // Версия кода — бампится при каждом присланном обновлении. Меню "ℹ️ Версия
 // кода" (ниже) сразу показывает, какая версия реально работает в Apps
 // Script — так не нужно гадать, долетело ли последнее обновление целиком.
-const CODE_VERSION = '2026-10-01-3';
+const CODE_VERSION = '2026-10-01-4';
 
 function showCodeVersion() {
   SpreadsheetApp.getUi().alert(`Версия кода: ${CODE_VERSION}`);
@@ -99,6 +99,7 @@ function onOpen() {
     .addItem('🗑 Проверить удалённые мероприятия...', 'checkDeletedEvents')
     .addItem('♻️ Исправить ложные пометки "УДАЛЕНО"...', 'fixFalseDeletions')
     .addItem('📝 Перенести черновики в BMS...', 'scanDraftAssignments')
+    .addItem('💰 Проставить отсутствующие ставки...', 'fixMissingRates')
     .addItem('✏️ Добавить мероприятие на доску вручную', 'addManualEntry')
     .addToUi();
 }
@@ -1761,6 +1762,119 @@ function detectDraftAssignment_(cellText, lineName) {
  * амплуа) — СРАЗУ ПРИМЕНЯЕТ в BMS (реальная запись, см. assignEmployeeInBms_).
  * Неоднозначные (несколько тёзок) — не трогает, только сообщает.
  */
+// ============================== АВАРИЙНЫЙ РЕМОНТ СТАВОК ==============================
+
+/**
+ * Находит все назначения за период, у которых есть реальный исполнитель, но
+ * НЕТ записи о ставке (expense_assignment_technical пуст) — ровно то, что
+ * оставлял старый баг в assignEmployeeInBms_ (до того как туда добавили
+ * второй запрос на accounting/expense/assignment/technical).
+ */
+function findMissingRates_(dateFrom, dateTo) {
+  const items = fetchAssignmentsForRange_(dateFrom, dateTo);
+  const found = [];
+  items.forEach(item => {
+    (item.event_service_lines || []).forEach(line => {
+      const at = line.assignment_technical;
+      if (!at || !at.employee) return; // не назначено — не наш случай
+      if (at.expense_assignment_technical) return; // ставка уже есть
+
+      found.push({
+        date: item.event.date,
+        teams: eventDisplayName_(item.event),
+        lineName: line.line ? line.line.name : '',
+        employeeName: `${at.employee.last_name} ${at.employee.first_name}`.trim(),
+        eventServiceId: item.id,
+        lineId: line.id,
+        assignmentTechnicalId: at.id,
+        employeeId: at.employee.id,
+        logistics: at.logistics || null,
+      });
+    });
+  });
+  return found;
+}
+
+/**
+ * Меню: сканирует период, показывает список найденных назначений без ставки
+ * для проверки, и только после явного подтверждения проставляет ставки всем
+ * найденным (тот же второй запрос, что теперь всегда идёт при обычном
+ * переносе — line_manual_rate: null, автоматический расчёт по таблице ставок).
+ */
+function fixMissingRates() {
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.prompt(
+    'Проставить отсутствующие ставки',
+    'За какой период проверить и исправить? Даты через тире (01.09.2026 - 30.09.2026):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+
+  const raw = resp.getResponseText().trim();
+  const parts = raw.split(/\s*-\s*/).filter(Boolean);
+  if (parts.length !== 2) { ui.alert('Нужно две даты через тире, например: 01.09.2026 - 30.09.2026'); return; }
+  const dateFrom = parseDateInput_(parts[0]);
+  const dateTo = parseDateInput_(parts[1]);
+  if (!dateFrom || !dateTo) { ui.alert('Не понял даты: ' + raw); return; }
+
+  let found;
+  try {
+    found = withBoardLock_(() => findMissingRates_(dateFrom, dateTo));
+  } catch (e) {
+    ui.alert(String(e));
+    return;
+  }
+
+  if (found.length === 0) {
+    ui.alert('Назначений без ставки за этот период не найдено.');
+    return;
+  }
+
+  const preview = found.slice(0, 20)
+    .map(f => `${f.date} ${f.teams} — ${amplua_(f.lineName)} — ${f.employeeName}`)
+    .join('\n');
+  const more = found.length > 20 ? `\n...и ещё ${found.length - 20}` : '';
+  const confirm = ui.alert(
+    'Найдено назначений без ставки',
+    `Найдено: ${found.length}.\n\n${preview}${more}\n\nПроставить ставки всем найденным сейчас?`,
+    ui.ButtonSet.YES_NO
+  );
+  if (confirm !== ui.Button.YES) return;
+
+  let fixed = 0;
+  const failed = [];
+  found.forEach(f => {
+    try {
+      bmsPost_('accounting/expense/assignment/technical', {
+        event_service_id: f.eventServiceId,
+        event_service_line_id: f.lineId,
+        assignment_technical_id: f.assignmentTechnicalId,
+        assignment_creative_id: null,
+        assignment_video_id: null,
+        assignment_data_sport_id: null,
+        employee_id: f.employeeId,
+        line_manual_rate: null,
+        logistics: f.logistics,
+        bonus: null,
+        bonus_comment: null,
+        penalty: null,
+        penalty_comment: null,
+        comment: '',
+        event_service_video_task_list: [],
+      });
+      fixed++;
+    } catch (e) {
+      failed.push(`${f.date} ${f.teams} — ${amplua_(f.lineName)} — ${f.employeeName}: ${e}`);
+    }
+  });
+
+  const summary = `Готово. Проставлено ставок: ${fixed} из ${found.length}. Ошибок: ${failed.length}.`;
+  Logger.log(summary + (failed.length ? '\n' + failed.join('\n') : ''));
+  ui.alert(failed.length > 0
+    ? summary + '\n\nПодробности ошибок — Apps Script -> Executions -> Logger.'
+    : summary);
+}
+
 function scanDraftAssignments() {
   const ui = SpreadsheetApp.getUi();
   const resp = ui.prompt(
